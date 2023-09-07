@@ -7,7 +7,7 @@ This script is a powerful utility for scraping torrent data from M-Team torrent 
 ### Features
 - **Automatic Scraping**: Scrape torrent data across a range of pages as specified.
 - **Rate Limiter**: Avoid being banned with a configurable rate limiter.
-- **Full-Text Search**: Perform searches across page titles, extracted torrent names, and file paths from torrent files.
+- **Full-Text Search**: Perform searches across page titles, torrent names, and file paths inside torrent files.
 - **Blazing fast**: Utilizes SQLite FTS5 for rapid searches (milliseconds response for over 250k torrents and 25m paths).
 - **Advanced Search**: Use multi-processing for regular expression searching. Slower but more powerful and comprehensive.
 
