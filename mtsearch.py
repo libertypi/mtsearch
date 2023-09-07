@@ -283,8 +283,7 @@ class Database:
         raise ValueError(f"Invalid search mode: {search_mode}")
 
     def _regex_search(self, pattern: str):
-        """Perform a regular expression search on the torrents database table
-        using multi-processing."""
+        """Perform a regular expression search using multi-processing."""
 
         result = {}
         futures = []
@@ -451,9 +450,7 @@ class RateLimiter:
 
 
 class MTeamScraper:
-    """
-    A scraper for downloading torrent information from M-Team domain.
-    """
+    """A scraper for downloading torrent information from M-Team."""
 
     def __init__(
         self,

@@ -24,6 +24,36 @@ pip install -r requirements.txt
 
 ## Usage
 
+1. Upon the first run, a default configuration file (`config.json`) will be generated alongside the script. Edit this config file if necessary.
+2. Scrape some data into the database.
+3. Perform searches.
+
+### Configuration File
+
+The script uses a configuration file (`config.json`) with the following fields:
+
+- `domain`: The URL of the M-Team site.
+- `pages`: List of pages to scrape.
+- `username`: Username for M-Team site (if "username" or "password" is null, prompt user at login).
+- `password`: Password for M-Team site (optional).
+- `maxRequests`: Maximum number of requests in a time window.
+- `timeWindow`: Time window in seconds for maxRequests.
+- `requestInterval`: Time interval between each request in seconds.
+
+Example Configuration:
+
+```json
+{
+    "domain": "https://xp.m-team.io",
+    "pages": ["adult.php"],
+    "username": null,
+    "password": null,
+    "maxRequests": 100,
+    "timeWindow": 3600,
+    "requestInterval": 20
+}
+```
+
 ### Basic Command-Line Usage
 
 ```
@@ -73,32 +103,6 @@ Update options:
 - Scrape from page 100 to the last avaliable page.
 
   `mtsearch.py -u -r 100-0`
-
-## Configuration File
-
-A default configuration file (`config.json`) will be generated alongside the script upon its first run:
-
-- `domain`: The URL of the M-Team site.
-- `pages`: List of pages to scrape.
-- `username`: Username for M-Team site (if "username" or "password" is null, prompt user at login).
-- `password`: Password for M-Team site (optional).
-- `maxRequests`: Maximum number of requests in a time window.
-- `timeWindow`: Time window in seconds for maxRequests.
-- `requestInterval`: Time interval between each request in seconds.
-
-### Example Configuration
-
-```json
-{
-    "domain": "https://xp.m-team.io",
-    "pages": ["adult.php"],
-    "username": null,
-    "password": null,
-    "maxRequests": 100,
-    "timeWindow": 3600,
-    "requestInterval": 20
-}
-```
 
 ## Data File
 
