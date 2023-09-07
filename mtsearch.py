@@ -36,6 +36,7 @@ Authors:
 --------
 - David Pi
 - ChatGPT - OpenAI
+- GitHub: https://github.com/libertypi/mtsearch
 """
 
 import argparse

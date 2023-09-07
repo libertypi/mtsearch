@@ -66,7 +66,7 @@ Update options:
 
 ### Examples (For updating)
 
-- Scrape 5 pages from pages as specified in the configuartion file, bypassing the rate limiter.
+- Scrape the 5 most recent pages, bypassing the rate limiter.
 
   `mtsearch.py -u --no-limit -r 5`
 
