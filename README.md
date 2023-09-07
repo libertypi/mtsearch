@@ -86,7 +86,7 @@ Update options:
 
   `mtsearch.py "foo"`
 
-- Search using FTS5 syntax (without -m, the 'OR' operator is treated literally):
+- Search using [FTS5](https://www.sqlite.org/fts5.html) syntax (without -m, the 'OR' operator is treated literally):
 
   `mtsearch.py -m "foo OR bar"`
 
