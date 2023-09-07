@@ -6,9 +6,10 @@ MTeam Scraper and Search Utility
 
 Description:
 ------------
-This script is designed to scrape torrent data from M-Team torrent sites and
-store it in a local SQLite database. It supports various search modes including
-fixed-string matching, SQLite FTS5 matching, and regular expression matching.
+This script is a powerful utility for scraping torrent data from M-Team torrent
+sites and storing it in a local database for fast searching. It supports various
+search modes including fixed-string matching, SQLite FTS5 matching, and regular
+expression matching.
 
 Main Functionality:
 -------------------

@@ -1,0 +1,4 @@
+requests
+lxml
+urllib3
+bencoder.pyx
