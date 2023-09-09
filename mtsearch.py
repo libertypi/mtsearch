@@ -288,8 +288,11 @@ class Database:
         result = {}
         futures = []
         query = "SELECT id FROM torrents ORDER BY id LIMIT 1 OFFSET ?"
-        uri = self.db_path.as_uri() + "?mode=ro"  # read-only
-        searcher = re.compile(pattern, re.IGNORECASE).search
+        args = (
+            self._re_worker,
+            self.db_path.as_uri() + "?mode=ro",  # read-only
+            re.compile(pattern, re.IGNORECASE).search,
+        )
 
         with ProcessPoolExecutor() as ex:
             # Note: Using `ex._max_workers` to get the number of workers.
@@ -304,9 +307,7 @@ class Database:
                     row += 1
                     remainder -= 1
                 end_id = self.c.execute(query, (row - 1,)).fetchone()[0]
-                futures.append(
-                    ex.submit(self._re_worker, uri, searcher, start_id, end_id)
-                )
+                futures.append(ex.submit(*args, start_id, end_id))
                 start_id = end_id
 
             # Collect multi-processing results
