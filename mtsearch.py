@@ -221,6 +221,16 @@ class Database:
             files = ()
             length = get_int(data, b"length")
 
+        # Verification
+        if not name:
+            raise ValueError("Empty torrent name.")
+        if not date >= 0:
+            logging.warning(f"Invalid creation date: '{date}'. ID: {tid}")
+        if not length >= 0:
+            logging.warning(f"Invalid torrent length: '{length}'. ID: {tid}")
+        if not all(f[1] and f[2] >= 0 for f in files):
+            logging.warning(f"Invalid file path. ID: {tid}")
+
         # Insert into the database
         with self.conn:
             self.c.execute(
