@@ -24,13 +24,14 @@ Usage:
 Configuration File:
 -------------------
 The script uses a configuration file (`config.json`) with the following fields:
-- `domain`: The URL of the M-Team site (default is "https://xp.m-team.io").
-- `pages`: List of pages to scrape (e.g., ["adult.php"]).
-- `username`: Username for M-Team site (optional).
+
+- `domain`: The URL of the M-Team site.
+- `pages`: List of pages to scrape.
+- `username`: Username for M-Team site (if "username" or "password" is null, prompt user at login).
 - `password`: Password for M-Team site (optional).
-- `maxRequests`: Maximum number of requests in a time window (default is 100).
-- `timeWindow`: Time window in seconds for maxRequests (default is 3600).
-- `requestInterval`: Time interval between each request in seconds (default is 20).
+- `maxRequests`: Maximum number of requests in a time window. Set to 0 or null to disable.
+- `timeWindow`: Time window in seconds for maxRequests. Set to 0 or null to disable.
+- `requestInterval`: Time interval between each request in seconds. Set to 0 or null to disable.
 
 Authors:
 --------
