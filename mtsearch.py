@@ -704,16 +704,16 @@ def is_positive(n) -> bool:
     return n is not None and n > 0
 
 
-def xp_compile(path: str, **kwargs):
-    return XPath(path, smart_strings=False, **kwargs)
-
-
 def get_int(d: dict, k) -> int:
     """Returns the integer value for key k in dict d, or 0 if invalid."""
     try:
         return int(d[k])
     except (KeyError, TypeError, ValueError):
         return 0
+
+
+def xp_compile(path: str, **kwargs):
+    return XPath(path, smart_strings=False, **kwargs)
 
 
 def humansize(size: int) -> str:
