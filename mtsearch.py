@@ -930,7 +930,7 @@ def main():
                 _search(args.pattern, *param)
             else:
                 while True:
-                    # Strip white-space only when interactive mode
+                    # Strip white-space only in interactive mode
                     pattern = input("Search pattern: ").strip()
                     if not pattern:
                         break
