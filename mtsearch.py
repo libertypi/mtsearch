@@ -65,7 +65,6 @@ from lxml.etree import XPath
 from lxml.html import fromstring as html_fromstring
 
 join_root = Path(__file__).parent.joinpath
-stdout_write = sys.stdout.write
 stderr_write = sys.stderr.write
 
 
@@ -897,23 +896,24 @@ def _search(pattern: str, db: Database, search_mode: str, domain: str):
     f2 = "{:6}: {}  [{}]\n".format
     f3 = "{:6}  {}  [{}]\n".format
     url = urljoin(domain, "details.php")
+    write = sys.stdout.write
 
     for s in results:
-        stdout_write(sep)
-        stdout_write(f1("Title", s.title))
-        stdout_write(f1("Name", s.name))
-        stdout_write(f1("Date", strftime(s.date)))
-        stdout_write(f1("Length", humansize(s.length)))
-        stdout_write(f1("ID", s.id))
-        stdout_write(f1("URL", f"{url}?id={s.id}"))
+        write(sep)
+        write(f1("Title", s.title))
+        write(f1("Name", s.name))
+        write(f1("Date", strftime(s.date)))
+        write(f1("Length", humansize(s.length)))
+        write(f1("ID", s.id))
+        write(f1("URL", f"{url}?id={s.id}"))
         if s.files:
             files = iter(s.files)
             p, l = next(files)
-            stdout_write(f2("Files", p, humansize(l)))
+            write(f2("Files", p, humansize(l)))
             for p, l in files:
-                stdout_write(f3("", p, humansize(l)))
+                write(f3("", p, humansize(l)))
 
-    stdout_write(
+    write(
         f"{sep}Found {len(results):,} results in {db.get_total():,} torrents ({sec:.4f} seconds).\n"
     )
 
