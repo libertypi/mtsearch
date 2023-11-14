@@ -321,7 +321,8 @@ class Database:
                 start_id = end_id
 
             # Collect multi-processing results
-            for future in as_completed(futures):
+            futures = as_completed(futures)
+            for future in futures:
                 result.update(future.result())
 
         return result
