@@ -2,7 +2,7 @@
 
 ## Description
 
-This script is a powerful utility for scraping torrent data from M-Team torrent sites and storing it in a local database for fast searching. It supports various search modes including fixed-string matching, SQLite FTS5 matching, and regular expression matching.
+MTSearch is a powerful utility for scraping torrent data from M-Team torrent sites and storing it in a local database for fast searching. It supports various search modes including fixed-string matching, SQLite FTS5 matching, and regular expression matching.
 
 ### Features
 - **Automatic Scraping**: Scrape torrent data across a range of pages as specified.
@@ -45,7 +45,7 @@ Example Configuration:
 ```json
 {
     "domain": "https://xp.m-team.io",
-    "pages": ["adult.php"],
+    "pages": ["movie.php"],
     "username": null,
     "password": null,
     "maxRequests": 100,
