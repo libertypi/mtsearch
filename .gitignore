@@ -1,6 +1,6 @@
 .vscode
-*.json
 *.db
+config.*
 cookies
 
 # Byte-compiled / optimized / DLL files

@@ -525,10 +525,10 @@ class MTeamScraper:
         s.mount("https://", adapter)
 
         # Load user agents
-        with open(join_root("useragents.txt"), "r", encoding="utf-8") as f:
-            self.useragents = tuple(filter(None, map(str.strip, f)))
+        with open(join_root("useragents.json"), "r", encoding="utf-8") as f:
+            self.useragents = json.load(f)
         if not self.useragents:
-            raise ValueError("The user-agent list must not be empty.")
+            raise ValueError("The user-agent data is empty.")
         s.headers["User-Agent"] = random_choice(self.useragents)
 
         try:
