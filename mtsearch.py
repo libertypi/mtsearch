@@ -529,7 +529,7 @@ class MTeamScraper:
             self.useragents = json.load(f)
         if not self.useragents:
             raise ValueError("The user-agent data is empty.")
-        s.headers["User-Agent"] = random_choice(self.useragents)
+        s.headers.update({"User-Agent": random_choice(self.useragents)})
 
         try:
             with open(self.cookie_path, "rb") as f:
