@@ -893,9 +893,9 @@ def _search(pattern: str, db: Database, search_mode: str, domain: str):
 
     # Print search results
     sep = "=" * 80 + "\n"
-    f1 = "{:6}: {}\n".format
-    f2 = "{:6}: {}  [{}]\n".format
-    f3 = "{:6}  {}  [{}]\n".format
+    f1 = "{:>5}: {}\n".format
+    f2 = "{:>5}: {}  [{}]\n".format
+    f3 = "{:>5}  {}  [{}]\n".format
     url = urljoin(domain, "details.php")
     write = sys.stdout.write
 
@@ -904,7 +904,7 @@ def _search(pattern: str, db: Database, search_mode: str, domain: str):
         write(f1("Title", s.title))
         write(f1("Name", s.name))
         write(f1("Date", strftime(s.date)))
-        write(f1("Length", humansize(s.length)))
+        write(f1("Size", humansize(s.length)))
         write(f1("ID", s.id))
         write(f1("URL", f"{url}?id={s.id}"))
         if s.files:
