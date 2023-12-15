@@ -856,7 +856,7 @@ def parse_config(config_path) -> dict:
      - If "username" or "password" is null, prompt user at login.
     """
     config = {
-        "domain": "https://xp.m-team.io",
+        "domain": "https://kp.m-team.cc",
         "pages": ["adult.php"],
         "username": None,
         "password": None,
