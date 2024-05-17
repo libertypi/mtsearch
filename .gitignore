@@ -1,7 +1,6 @@
 .vscode
 *.db
 config.*
-cookies
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

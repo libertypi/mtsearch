@@ -24,7 +24,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-1. Upon the first run, a default configuration file (`config.json`) will be generated alongside the script. Edit this config file if necessary.
+1. Upon the first run, a default configuration file (`config.json`) will be generated alongside the script. Edit this config file before running this script again.
 2. Scrape some data into the database.
 3. Perform searches.
 
@@ -32,25 +32,30 @@ pip install -r requirements.txt
 
 The script uses a configuration file (`config.json`) with the following fields:
 
-- `domain`: The URL of the M-Team site.
-- `pages`: List of pages to scrape.
-- `username`: Username for M-Team site (if "username" or "password" is null, prompt user at login).
-- `password`: Password for M-Team site (optional).
-- `maxRequests`: Maximum number of requests in a time window. Set to 0 or null to disable.
-- `timeWindow`: Time window in seconds for maxRequests. Set to 0 or null to disable.
-- `requestInterval`: Time interval between each request in seconds. Set to 0 or null to disable.
+- `api_key`: API key for M-Team site.
+- `domain`: The URL of the M-Team site. Leave empty to use the default domain.
+- `hourlyLimit`: Maximum number of requests in an hour. Set to 0 to disable.
+- `requestInterval`: Time interval between each request in seconds. Set to 0 to disable.
+- `mode_categories`: List of modes and their subcategories to scrape. `mode` can be: `normal`, `adult`, `movie`, `music`, `tvshow`, `waterfall`, `rss`, `rankings`. `categories` is a list of integers where an empty list includes all subcategories.
 
 Example Configuration:
 
 ```json
 {
-    "domain": "https://xp.m-team.io",
-    "pages": ["movie.php"],
-    "username": null,
-    "password": null,
-    "maxRequests": 100,
-    "timeWindow": 3600,
-    "requestInterval": 20
+    "api_key": "your_api_key_here",
+    "domain": null,
+    "hourlyLimit": 100,
+    "requestInterval": 10,
+    "mode_categories": [
+        {
+            "mode": "adult",
+            "categories": []
+        },
+        {
+            "mode": "movie",
+            "categories": [404, 421]
+        }
+    ]
 }
 ```
 
@@ -71,8 +76,7 @@ Search Options:
   pattern          Specify the search pattern
 
 Update options:
-  -r PAGE_RANGE    Specify page range as 'start-end', 'end', or '0' for unlimited (Default: 3)
-  --dump DUMP_DIR  Save torrent files to this directory
+  -r PAGE_RANGE    Specify page range as 'start-end', or 'end' (Default: 3)
   --no-limit       Disable rate limit defined in the config file
 ```
 
@@ -100,10 +104,6 @@ Update options:
 
   `mtsearch.py -u --no-limit -r 5`
 
-- Scrape from page 100 to the last avaliable page.
-
-  `mtsearch.py -u -r 100-0`
-
 ## Data File
 
 A SQLite database named `data.db` will be created in the script's directory, storing all scraped torrent data. Ensure you back up this database as needed.
@@ -117,10 +117,10 @@ Currently, M-Team's website appears to implement two types of rate limiting:
 
 In this script, both types of rate limiting are addressed through the configuration file:
 
+- `"hourlyLimit": 100` signifies that a maximum of 100 requests can be made within a 3600-second window.
 - `"requestInterval": 20` implies that there should be a 20-second gap between each request.
-- `"maxRequests": 100, "timeWindow": 3600` signifies that a maximum of 100 requests can be made within a 3600-second window.
 
-> **Note**: These rate limits only apply to the listing pages specified in the configuration file and exclude torrent download requests. You're free to experiment with different settings until you get banned. For scraping a small number of pages, use the `--no-limit` switch to temporarily disable the rate limiter.
+> **Note**: You're free to experiment with different settings of rate limits until you get banned. For scraping a small number of pages, use the `--no-limit` switch to temporarily disable the rate limiter.
 
 ## Authors
 

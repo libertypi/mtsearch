@@ -25,13 +25,15 @@ Configuration File:
 -------------------
 The script uses a configuration file (`config.json`) with the following fields:
 
-- `domain`: The URL of the M-Team site.
-- `pages`: List of pages to scrape.
-- `username`: Username for M-Team site (if "username" or "password" is null, prompt user at login).
-- `password`: Password for M-Team site (optional).
-- `maxRequests`: Maximum number of requests in a time window. Set to 0 or null to disable.
-- `timeWindow`: Time window in seconds for maxRequests. Set to 0 or null to disable.
-- `requestInterval`: Time interval between each request in seconds. Set to 0 or null to disable.
+- `api_key`: API key for M-Team site.
+- `domain`: The URL of the M-Team site. Leave empty to use the default domain.
+- `hourlyLimit`: Maximum number of requests in an hour. Set to 0 to disable.
+- `requestInterval`: Time interval between each request in seconds. Set to 0 to
+  disable.
+- `mode_categories`: List of modes and their subcategories to scrape. `mode` can
+  be: `normal`, `adult`, `movie`, `music`, `tvshow`, `waterfall`, `rss`,
+  `rankings`. `categories` is a list of integers where an empty list includes
+  all subcategories.
 
 Authors:
 --------
@@ -44,25 +46,19 @@ import argparse
 import dataclasses
 import json
 import logging
-import pickle
 import re
 import sqlite3
 import sys
 import time
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from getpass import getpass
 from operator import attrgetter
 from pathlib import Path
-from random import choice as random_choice
 from typing import Iterable
 from urllib.parse import urljoin
 
 import requests
 import urllib3
-from bencoder import bdecode  # bencoder.pyx
-from lxml.etree import XPath
-from lxml.html import fromstring as html_fromstring
 
 join_root = Path(__file__).parent.joinpath
 stderr_write = sys.stderr.write
@@ -196,46 +192,12 @@ class Database:
         """Get the total number of rows in the 'torrents' table."""
         return self.c.execute("SELECT COUNT(*) FROM torrents").fetchone()[0]
 
-    def insert_torrent(self, tid: int, title: str, data: bytes):
+    def insert_torrent(self, detail: tuple, files: tuple):
         """Insert the metadata of a new torrent into the database."""
-
-        # Decode the torrent
-        data = bdecode(data)
-        date = get_int(data, b"creation date")
-        data = data[b"info"]
-        name = (data[b"name.utf-8"] if b"name.utf-8" in data else data[b"name"]).decode(
-            errors="ignore"
-        )
-
-        # Check if the torrent has multiple files
-        files = data.get(b"files")
-        if files:
-            k = b"path.utf-8" if b"path.utf-8" in files[0] else b"path"
-            join = b"/".join
-            files = tuple(
-                (tid, join(f[k]).decode(errors="ignore"), get_int(f, b"length"))
-                for f in files
-            )
-            length = sum(f[2] for f in files)
-        else:
-            files = ()
-            length = get_int(data, b"length")
-
-        # Verification
-        if not name:
-            raise ValueError("Empty torrent name.")
-        if not date >= 0:
-            logging.warning(f"Invalid creation date: '{date}'. ID: {tid}")
-        if not length >= 0:
-            logging.warning(f"Invalid torrent length: '{length}'. ID: {tid}")
-        if not all(f[1] and f[2] >= 0 for f in files):
-            logging.warning(f"Invalid file path. ID: {tid}")
-
-        # Insert into the database
         with self.conn:
             self.c.execute(
                 "INSERT INTO torrents (id, title, name, date, length) VALUES (?, ?, ?, ?, ?)",
-                (tid, title, name, date, length),
+                detail,
             )
             self.c.executemany(
                 "INSERT INTO files (id, path, length) VALUES (?, ?, ?)",
@@ -393,51 +355,42 @@ class RateLimiter:
     non-positive values disable the corresponding rate limit.
 
     Parameters:
-     - max_requests: The maximum number of requests allowed in a given time
-       window for global rate limiting.
-     - time_window: The time window (in seconds) for the global rate limiting.
+     - hourly_limit: The maximum number of requests allowed in an hour for
+       global rate limiting.
      - request_interval: The minimum time interval (in seconds) between
        consecutive requests for per-request rate limiting.
     """
 
-    def __init__(self, max_requests: int, time_window: int, request_interval: int):
+    def __init__(self, hourly_limit: int = None, request_interval: int = None):
         self._waitlist = []
-        self.request_que = deque()
         self.last_request = 0
 
-        # Configure global rate limiting
-        if is_positive(max_requests) and is_positive(time_window):
-            self.max_requests = max_requests
-            self.time_window = time_window
+        if hourly_limit and hourly_limit > 0:
+            self.hourly_limit = hourly_limit
+            self.request_que = deque()
             self._waitlist.append(self.wait_global)
         else:
-            self.max_requests = float("inf")
-            self.time_window = 0
+            self.hourly_limit = float("inf")
+            self.request_que = None
 
-        # Configure per-request rate limiting
-        if is_positive(request_interval):
+        if request_interval and request_interval > 0:
             self.request_interval = request_interval
             self._waitlist.append(self.wait_request)
         else:
             self.request_interval = 0
 
-    def wait(self):
-        """Invoke all active rate limiting checks."""
-        for func in self._waitlist:
-            func()
-
     def wait_global(self):
         """Global rate limiting logic."""
         que = self.request_que
-        oldest_allowed = time.time() - self.time_window
+        oldest_allowed = time.time() - 3600
         while que and que[0] <= oldest_allowed:
             self.request_que.popleft()
 
-        if len(que) >= self.max_requests:
+        if len(que) >= self.hourly_limit:
             sleep = que[0] - oldest_allowed
             stderr_write(
                 f"Global rate limit reached. Waiting for {sleep:.2f} seconds. "
-                f"Current setting: {self.max_requests} requests in {self.time_window} seconds\n"
+                f"Hourly limit: {self.hourly_limit}.\n"
             )
             time.sleep(sleep)
 
@@ -446,73 +399,52 @@ class RateLimiter:
         sleep = self.request_interval - time.time() + self.last_request
         if sleep > 0:
             stderr_write(
-                f"Waiting for {sleep:.2f}s. Current interval: {self.request_interval:.2f} seconds\n"
+                f"Waiting for {sleep:.2f}s. Request interval: {self.request_interval:.2f} seconds.\n"
             )
             time.sleep(sleep)
 
-    def record_request(self):
+    def __enter__(self):
+        """Invoke all active rate limiting checks."""
+        for func in self._waitlist:
+            func()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
         """Record the time of the most recent request."""
         self.last_request = time.time()
-        if self.time_window:
+        if self.request_que is not None:
             self.request_que.append(self.last_request)
-
-    def extend_interval(self, factor: float, max_interval: float):
-        """Extend the request interval by a factor, up to a maximum value."""
-        self.request_interval = min(self.request_interval * factor, max_interval)
 
 
 class MTeamScraper:
     """A scraper for downloading torrent information from M-Team."""
 
+    _domain = "https://kp.m-team.cc"
+    _pageSize = 100
+
     def __init__(
         self,
+        api_key: str,
         domain: str,
         database: Database,
-        cookies_name: str = "cookies",
-        username: str = None,
-        password: str = None,
-        max_requests: int = None,
-        time_window: int = None,
-        request_interval: int = None,
-        dump_dir: str = None,
+        ratelimiter: RateLimiter,
     ):
         """Initializes the MTeamScraper instance."""
-        self.domain = domain
+        if not api_key:
+            raise ValueError("api_key is null.")
+        self.api_key = api_key
+
+        domain = domain or self._domain
+        self._search_url = urljoin(domain, "/api/torrent/search")
+        self._detail_url = urljoin(domain, "/api/torrent/detail")
+        self._files_url = urljoin(domain, "/api/torrent/files")
+
         self.database = database
-        self.credential = (
-            {"username": username, "password": password}
-            if username and password
-            else None
-        )
-        self.ratelimiter = RateLimiter(
-            max_requests=max_requests,
-            time_window=time_window,
-            request_interval=request_interval,
-        )
-
-        # Setup dump dir if provided
-        if dump_dir:
-            self.dump_dir = Path(dump_dir)
-            self.dump_dir.mkdir(parents=True, exist_ok=True)
-            self._save_torrent = self._save_to_file_and_db
-        else:
-            self.dump_dir = None
-            self._save_torrent = database.insert_torrent
-
-        # Initialize cookie storage path and session
-        self.cookie_path = join_root(cookies_name)
+        self.ratelimiter = ratelimiter
         self._init_session()
 
-        # Initialize request method with login check
-        self.get = self._login_and_get
-
-        self.xp_throttle = xp_compile(
-            "string(//h3/text()[re:test(., '请求.*?频繁')])",
-            namespaces={"re": "http://exslt.org/regular-expressions"},
-        )
-
     def _init_session(self):
-        """Initialize a requests session with retries and user agent."""
+        """Initialize a requests session with retries."""
         self.session = s = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
             max_retries=urllib3.Retry(
@@ -523,185 +455,104 @@ class MTeamScraper:
         )
         s.mount("http://", adapter)
         s.mount("https://", adapter)
+        s.headers.update({"x-api-key": self.api_key})
 
-        # Load user agents
-        with open(join_root("useragents.json"), "r", encoding="utf-8") as f:
-            self.useragents = json.load(f)
-        if not self.useragents:
-            raise ValueError("The user-agent data is empty.")
-        s.headers.update({"User-Agent": random_choice(self.useragents)})
-
-        try:
-            with open(self.cookie_path, "rb") as f:
-                s.cookies = pickle.load(f)
-        except Exception:
-            pass
-
-    def dump_cookies(self):
-        """Save session cookies to a file."""
-        try:
-            with open(self.cookie_path, "wb") as f:
-                pickle.dump(self.session.cookies, f)
-        except OSError as e:
-            stderr_write(f"Unable to save cookies at '{self.cookie_path}': {e}\n")
-
-    def _get(self, url: str, **kwargs):
-        """Perform an HTTP GET request and return the response."""
-        stderr_write(f"Connecting: {url} {kwargs or ''}\n")
-        response = self.session.get(
-            url=url,
-            headers={"User-Agent": random_choice(self.useragents)},
-            **kwargs,
-        )
-        response.raise_for_status()
-        return response
-
-    def _login_and_get(self, url: str, **kwargs):
-        """Attempt to perform an HTTP GET request; log in if redirected"""
-        response = self._get(url, **kwargs)
-        if "/login.php" in response.url:
-            while True:
-                credential = self.credential or {
-                    "username": input("Username: "),
-                    "password": getpass("Password: "),
-                }
-                self.session.post(
-                    url=urljoin(self.domain, "takelogin.php"),
-                    data=credential,
-                    headers={"referer": urljoin(self.domain, "login.php")},
-                )
-                response = self._get(url, **kwargs)
-                if "/login.php" not in response.url:
-                    self.dump_cookies()
-                    break
-                if self.credential:
-                    raise LogException("Login failed. Check credential in config file.")
-                stderr_write("Login failed. Try again.\n")
-        self.get = self._get
-        return response
-
-    def get_tree(self, url: str, **kwargs):
-        """Fetch a URL and parse it into an lxml HTML tree."""
-
-        self.ratelimiter.wait()
-
+    def _request_json(self, url: str, **kwargs):
         while True:
-            # Make the request
-            response = self.get(url, **kwargs)
-            self.ratelimiter.record_request()
+            with self.ratelimiter:
+                stderr_write(f"Connecting: {url}\n")
+                for k in "json", "data":
+                    if k in kwargs:
+                        stderr_write(f"  {kwargs[k]}\n")
+                res = self.session.post(url=url, **kwargs)
+            res.raise_for_status()
+            res = res.json()
 
-            # Parse the response
-            tree = html_fromstring(response.content, base_url=response.url)
+            message = res["message"]
+            if message.upper() == "SUCCESS":
+                return res
+            elif "請求過於頻繁" in message:
+                stderr_write("Throttled. Waiting for 60 seconds.\n")
+                time.sleep(60)
+            elif "key無效" in message:
+                raise LogException("Invalid API key. Check credential in config file.")
+            else:
+                raise LogException(message)
 
-            # Check for throttling
-            throttle_text = self.xp_throttle(tree)
-            if not throttle_text:
-                return tree
+    def _get_list(self, mode: str, categories: list, page: int) -> list:
+        return self._request_json(
+            url=self._search_url,
+            headers={"Content-Type": "application/json"},
+            json={
+                "mode": mode,
+                "categories": categories or (),
+                "pageNumber": page + 1,
+                "pageSize": self._pageSize,
+                "visible": 0,
+            },
+        )["data"]["data"]
 
-            try:
-                # Extract sleep time from meta tag
-                sleep = tree.xpath('number(//meta[@http-equiv="refresh"]/@content)')
-                if not sleep > 0:
-                    raise ValueError
-                stderr_write(f"Throttled. Waiting for {sleep} seconds.\n")
-            except ValueError:
-                # Handle missing meta tag
-                if "限制访问" in throttle_text:
-                    raise LogException(
-                        f"Critical Issue ('Fucked'): {throttle_text}. URL: {response.url}"
-                    )
-                sleep = 120  # default to 120s
-                stderr_write(
-                    f"Throttled and refresh tag not found. Waiting for {sleep} seconds. Message: {throttle_text}\n"
-                )
+    def _get_detail(self, tid: int):
+        return self._request_json(
+            url=self._detail_url,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={"id": tid},
+        )["data"]
 
-            # Update minimum request interval
-            self.ratelimiter.extend_interval(factor=1.5, max_interval=sleep)
+    def _get_files(self, tid: int):
+        return self._request_json(
+            url=self._files_url,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={"id": tid},
+        )["data"]
 
-            # Sleep for the required time
-            time.sleep(sleep)
+    def scrape(self, mode: str, categories: list, page_range: range):
 
-    def _get_pages(self, page: str, page_range: tuple):
-        lo, hi = page_range
-        if 0 < hi <= lo:
-            raise ValueError("'end' must be greater than 'start' or 0 for no limit.")
-
-        # Prepare the URL and fetch the first page
-        url = urljoin(self.domain, page)
-        params = {"incldead": 0, "page": lo}
-        tree = self.get_tree(url, params=params)
-
-        # Determine the total number of pages
-        total = tree.xpath(
-            'string(//td[@id="outer"]/table//td/p[@align="center"]/a[contains(@href, "page=")][last()]/@href)'
-        )
-        try:
-            total = int(re.search(r"\bpage=(\d+)", total)[1]) + 1
-        except Exception:
-            raise LogException(f"Failed to identify pagination: '{tree.base_url}'")
-        if not (0 < hi <= total):
-            hi = total
-
-        yield tree
-        del tree
-        for i in range(lo + 1, hi):
-            params["page"] = i
-            yield self.get_tree(url, params=params)
-
-    def _get_title_from_details(self, tid: int):
-        # "details.php" has an independent and more lenient rate control
-        tree = html_fromstring(
-            self.get(
-                urljoin(self.domain, "details.php"),
-                params={"id": tid},
-            ).content
-        )
-        title = tree.xpath('string(//input[@name="torrent_name"]/@value)')
-        return title or tree.xpath('string(.//h1[@id="top"]/text())')
-
-    def scrape(self, page: str, page_range: tuple):
-        """Scrape specified pages and update the database."""
-        id_searcher = re.compile(r"\bid=(\d+)").search
         contains_id = self.database.contains_id
+        removesuffix = re.compile(r"\.torrent$", re.I).sub
 
-        # Prepare XPath queries for titles and links
-        epath = './/form[@id="form_torrent"]/table[@class="torrents"]//table[@class="torrentname"]/tr[1]'
-        xp_t1 = xp_compile('string(td[2]/a[contains(@href, "details.php?")]/@title)')
-        xp_t2 = xp_compile('string(td[2]/a[contains(@href, "details.php?")])')
-        xp_lk = xp_compile('string(td[3]/a[contains(@href, "download.php?")]/@href)')
-
-        for tree in self._get_pages(page, page_range):
-            for tree in tree.iterfind(epath):
-                link = xp_lk(tree)
+        for page in page_range:
+            for item in self._get_list(mode, categories, page):
+                tid = item.get("id")
                 try:
-                    tid = int(id_searcher(link)[1])
+                    tid = int(tid)
                     if contains_id(tid):
                         continue
-                    title = xp_t1(tree)
-                    if not title:
-                        title = xp_t2(tree)
-                        if not title or title.endswith(".."):
-                            title = self._get_title_from_details(tid)
-                    title = title.strip()
-                    if not title:
-                        raise ValueError("Empty title.")
-                    self._save_torrent(
-                        tid, title, self.get(urljoin(self.domain, link)).content
+                    detail = self._get_detail(tid)
+
+                    title = detail["name"]
+                    if not (isinstance(title, str) and title):
+                        raise ValueError(f"Invalid title '{title}'.")
+
+                    name = removesuffix("", detail["originFileName"], 1)
+                    if not name:
+                        raise ValueError("Empty torrent name.")
+
+                    date = strptime(detail["createdDate"])
+                    if not date >= 0:
+                        logging.warning(f"Invalid creation date: '{date}'.")
+
+                    if get_int(detail, "numfiles") > 1:
+                        files = tuple(
+                            (tid, f["name"], get_int(f, "size"))
+                            for f in self._get_files(tid)
+                        )
+                        if not all(f[1] and f[2] >= 0 for f in files):
+                            logging.warning(f"Invalid file path.")
+                        length = sum(f[2] for f in files)
+                    else:
+                        files = ()
+                        length = get_int(detail, "size")
+
+                    if not length >= 0:
+                        logging.warning(f"Invalid torrent length: '{length}'.")
+
+                    self.database.insert_torrent(
+                        detail=(tid, title, name, date, length),
+                        files=files,
                     )
                 except Exception as e:
-                    logging.error(f"Failed to process torrent at '{link}': {e}")
-
-    def _save_to_file_and_db(self, tid: int, title: str, data: bytes):
-        try:
-            with open(self.dump_dir.joinpath(f"{tid}.torrent"), "wb") as f:
-                f.write(data)
-        except Exception as e:
-            stderr_write(f"Saving torrent failed: {e}\n")
-        self.database.insert_torrent(tid, title, data)
-
-
-def is_positive(n) -> bool:
-    return n is not None and n > 0
+                    logging.error(f"Failed to process torrent '{tid}': {e}")
 
 
 def get_int(d: dict, k) -> int:
@@ -712,8 +563,19 @@ def get_int(d: dict, k) -> int:
         return 0
 
 
-def xp_compile(path: str, **kwargs):
-    return XPath(path, smart_strings=False, **kwargs)
+def strptime(string: str, fmt: str = "%Y-%m-%d %H:%M:%S") -> int:
+    """Convert a date string to epoch time."""
+    try:
+        return int(time.mktime(time.strptime(string, fmt)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def strftime(epoch: int, fmt: str = "%F") -> str:
+    """Convert epoch time to a formatted date string."""
+    if epoch is None:
+        raise TypeError("Epoch argument cannot be None.")
+    return time.strftime(fmt, time.gmtime(epoch))
 
 
 def humansize(size: int) -> str:
@@ -723,12 +585,6 @@ def humansize(size: int) -> str:
             return f"{size:.2f} {suffix}B"
         size /= 1024
     return f"{size:.2f} YiB"
-
-
-def strftime(epoch: int, fmt: str = "%F") -> str:
-    if epoch is None:
-        raise TypeError("Epoch argument cannot be None.")
-    return time.strftime(fmt, time.gmtime(epoch))
 
 
 def config_logging(filename: str = "logfile.log"):
@@ -749,7 +605,7 @@ def parse_args():
     def parse_range(range_str: str):
         m = re.fullmatch(r"(?:(\d+)-)?(\d+)", range_str)
         if m:
-            return int(m[1] or 0), int(m[2])
+            return range(int(m[1] or 0), int(m[2]))
         raise argparse.ArgumentTypeError(
             "Invalid range format. Use 'start-end' or 'end'."
         )
@@ -831,12 +687,7 @@ Examples:
         dest="page_range",
         type=parse_range,
         default="3",
-        help="Specify page range as 'start-end', 'end', or '0' for unlimited (Default: %(default)s)",
-    )
-    group.add_argument(
-        "--dump",
-        dest="dump_dir",
-        help="Save torrent files to this directory",
+        help="Specify page range as 'start-end', or 'end' (Default: %(default)s)",
     )
     group.add_argument(
         "--no-limit",
@@ -849,20 +700,13 @@ Examples:
 
 
 def parse_config(config_path) -> dict:
-    """
-    Parse the JSON-formatted configuration file located at `config_path`.
-
-    Notes:
-     - If "username" or "password" is null, prompt user at login.
-    """
+    """Parse the JSON-formatted configuration file located at `config_path`."""
     config = {
+        "api_key": "",
         "domain": "https://kp.m-team.cc",
-        "pages": ["adult.php"],
-        "username": None,
-        "password": None,
-        "maxRequests": 100,
-        "timeWindow": 3600,
-        "requestInterval": 20,
+        "hourlyLimit": 100,
+        "requestInterval": 10,
+        "mode_categories": [{"mode": "adult", "categories": []}],
     }
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -884,6 +728,7 @@ def parse_config(config_path) -> dict:
 
 
 def _search(pattern: str, db: Database, search_mode: str, domain: str):
+    """Perform a search in the local database and print the results."""
     sec = time.time()
     results = db.search(pattern, search_mode)
     sec = time.time() - sec
@@ -923,10 +768,10 @@ def main():
     config_logging()
     args = parse_args()
     conf = parse_config(join_root("config.json"))
-    db = Database()
+    database = Database()
     try:
         if args.mode == "search":
-            param = (db, args.search_mode, conf["domain"])
+            param = (database, args.search_mode, conf["domain"])
             if args.pattern:
                 _search(args.pattern, *param)
             else:
@@ -938,27 +783,29 @@ def main():
                     _search(pattern, *param)
         elif args.mode == "update":
             if args.nolimit:
-                conf["maxRequests"] = conf["requestInterval"] = None
+                ratelimiter = RateLimiter()
+            else:
+                ratelimiter = RateLimiter(conf["hourlyLimit"], conf["requestInterval"])
             mt = MTeamScraper(
+                api_key=conf["api_key"],
                 domain=conf["domain"],
-                database=db,
-                username=conf["username"],
-                password=conf["password"],
-                max_requests=conf["maxRequests"],
-                time_window=conf["timeWindow"],
-                request_interval=conf["requestInterval"],
-                dump_dir=args.dump_dir,
+                database=database,
+                ratelimiter=ratelimiter,
             )
-            for page in conf["pages"]:
-                mt.scrape(page, args.page_range)
+            for m in conf["mode_categories"]:
+                mt.scrape(
+                    mode=m["mode"],
+                    categories=m["categories"],
+                    page_range=args.page_range,
+                )
         else:
             raise ValueError(f"Invalid operation mode: {args.mode}")
     except LogException as e:
         logging.error(e)
     except Exception as e:
-        stderr_write(f"ERROR: {e}\n")
+        stderr_write(f"Error: {e}\n")
     finally:
-        db.close()
+        database.close()
 
 
 if __name__ == "__main__":
