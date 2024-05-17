@@ -34,8 +34,8 @@ The script uses a configuration file (`config.json`) with the following fields:
 
 - `api_key`: API key for M-Team site.
 - `domain`: The URL of the M-Team site. Leave empty to use the default domain.
-- `hourlyLimit`: Maximum number of requests in an hour. Set to 0 to disable.
-- `requestInterval`: Time interval between each request in seconds. Set to 0 to disable.
+- `hourly_limit`: Maximum number of requests in an hour. Set to 0 to disable.
+- `request_interval`: Time interval between each request in seconds. Set to 0 to disable.
 - `mode_categories`: List of modes and their subcategories to scrape. `mode` can be: `normal`, `adult`, `movie`, `music`, `tvshow`, `waterfall`, `rss`, `rankings`. `categories` is a list of integers where an empty list includes all subcategories.
 
 Example Configuration:
@@ -44,8 +44,8 @@ Example Configuration:
 {
     "api_key": "your_api_key_here",
     "domain": null,
-    "hourlyLimit": 100,
-    "requestInterval": 10,
+    "hourly_limit": 100,
+    "request_interval": 10,
     "mode_categories": [
         {
             "mode": "adult",
@@ -117,8 +117,8 @@ Currently, M-Team's website appears to implement two types of rate limiting:
 
 In this script, both types of rate limiting are addressed through the configuration file:
 
-- `"hourlyLimit": 100` signifies that a maximum of 100 requests can be made within a 3600-second window.
-- `"requestInterval": 20` implies that there should be a 20-second gap between each request.
+- `"hourly_limit": 100` signifies that a maximum of 100 requests can be made within a 3600-second window.
+- `"request_interval": 20` implies that there should be a 20-second gap between each request.
 
 > **Note**: You're free to experiment with different settings of rate limits until you get banned. For scraping a small number of pages, use the `--no-limit` switch to temporarily disable the rate limiter.
 

@@ -27,8 +27,8 @@ The script uses a configuration file (`config.json`) with the following fields:
 
 - `api_key`: API key for M-Team site.
 - `domain`: The URL of the M-Team site. Leave empty to use the default domain.
-- `hourlyLimit`: Maximum number of requests in an hour. Set to 0 to disable.
-- `requestInterval`: Time interval between each request in seconds. Set to 0 to
+- `hourly_limit`: Maximum number of requests in an hour. Set to 0 to disable.
+- `request_interval`: Time interval between each request in seconds. Set to 0 to
   disable.
 - `mode_categories`: List of modes and their subcategories to scrape. `mode` can
   be: `normal`, `adult`, `movie`, `music`, `tvshow`, `waterfall`, `rss`,
@@ -60,8 +60,9 @@ from urllib.parse import urljoin
 import requests
 import urllib3
 
-join_root = Path(__file__).parent.joinpath
+logger = logging.getLogger(__name__)
 stderr_write = sys.stderr.write
+_DOMAIN = "https://kp.m-team.cc"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,12 +77,6 @@ class SearchResult:
     files: list = dataclasses.field(default_factory=list)
 
 
-class LogException(Exception):
-    """This exception is intended to be logged when caught."""
-
-    pass
-
-
 class Database:
     """
     Database class for managing SQL operations related to torrents.
@@ -89,9 +84,9 @@ class Database:
 
     not_regex = frozenset(r"[]{}().*?+\|^$").isdisjoint
 
-    def __init__(self, db_name: str = "data.db"):
+    def __init__(self, db_path: Path):
         """Initialize the database."""
-        self.db_path = join_root(db_name)
+        self.db_path = db_path
         self.conn = sqlite3.connect(self.db_path)
         self.c = self.conn.cursor()
 
@@ -363,21 +358,20 @@ class RateLimiter:
 
     def __init__(self, hourly_limit: int = None, request_interval: int = None):
         self._waitlist = []
+        self.request_que = deque()
         self.last_request = 0
 
         if hourly_limit and hourly_limit > 0:
             self.hourly_limit = hourly_limit
-            self.request_que = deque()
             self._waitlist.append(self.wait_global)
         else:
-            self.hourly_limit = float("inf")
-            self.request_que = None
+            self.hourly_limit = None
 
         if request_interval and request_interval > 0:
             self.request_interval = request_interval
             self._waitlist.append(self.wait_request)
         else:
-            self.request_interval = 0
+            self.request_interval = None
 
     def wait_global(self):
         """Global rate limiting logic."""
@@ -389,8 +383,7 @@ class RateLimiter:
         if len(que) >= self.hourly_limit:
             sleep = que[0] - oldest_allowed
             stderr_write(
-                f"Global rate limit reached. Waiting for {sleep:.2f} seconds. "
-                f"Hourly limit: {self.hourly_limit}.\n"
+                f"Global rate limit reached. Waiting for {sleep:.2f} seconds. Hourly limit: {self.hourly_limit}.\n"
             )
             time.sleep(sleep)
 
@@ -412,15 +405,15 @@ class RateLimiter:
     def __exit__(self, exc_type, exc_value, traceback):
         """Record the time of the most recent request."""
         self.last_request = time.time()
-        if self.request_que is not None:
+        if self.hourly_limit:
             self.request_que.append(self.last_request)
 
 
 class MTeamScraper:
     """A scraper for downloading torrent information from M-Team."""
 
-    _domain = "https://kp.m-team.cc"
     _pageSize = 100
+    _sleep = 120
 
     def __init__(
         self,
@@ -434,7 +427,6 @@ class MTeamScraper:
             raise ValueError("api_key is null.")
         self.api_key = api_key
 
-        domain = domain or self._domain
         self._search_url = urljoin(domain, "/api/torrent/search")
         self._detail_url = urljoin(domain, "/api/torrent/detail")
         self._files_url = urljoin(domain, "/api/torrent/files")
@@ -444,7 +436,7 @@ class MTeamScraper:
         self._init_session()
 
     def _init_session(self):
-        """Initialize a requests session with retries."""
+        """Initialize a requests session with retries and headers."""
         self.session = s = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
             max_retries=urllib3.Retry(
@@ -455,9 +447,15 @@ class MTeamScraper:
         )
         s.mount("http://", adapter)
         s.mount("https://", adapter)
-        s.headers.update({"x-api-key": self.api_key})
+        s.headers.update(
+            {
+                "x-api-key": self.api_key,
+                "User-Agent": "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.",
+            }
+        )
 
-    def _request_json(self, url: str, **kwargs):
+    def _request_json(self, url: str, **kwargs) -> dict:
+        """Make a POST request and handle rate limiting and retries."""
         while True:
             with self.ratelimiter:
                 stderr_write(f"Connecting: {url}\n")
@@ -469,17 +467,18 @@ class MTeamScraper:
             res = res.json()
 
             message = res["message"]
-            if message.upper() == "SUCCESS":
+            if "SUCCESS" in message.upper():
                 return res
             elif "請求過於頻繁" in message:
-                stderr_write("Throttled. Waiting for 60 seconds.\n")
-                time.sleep(60)
+                stderr_write(f"Throttled. Waiting for {self._sleep} seconds.\n")
+                time.sleep(self._sleep)
             elif "key無效" in message:
-                raise LogException("Invalid API key. Check credential in config file.")
+                raise Exception("Invalid API key. Check credential in config file.")
             else:
-                raise LogException(message)
+                raise Exception(message)
 
     def _get_list(self, mode: str, categories: list, page: int) -> list:
+        """Get a list of torrents from the M-Team API."""
         return self._request_json(
             url=self._search_url,
             headers={"Content-Type": "application/json"},
@@ -493,6 +492,7 @@ class MTeamScraper:
         )["data"]["data"]
 
     def _get_detail(self, tid: int):
+        """Get details of a specific torrent."""
         return self._request_json(
             url=self._detail_url,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -500,6 +500,7 @@ class MTeamScraper:
         )["data"]
 
     def _get_files(self, tid: int):
+        """Get files of a specific torrent."""
         return self._request_json(
             url=self._files_url,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -507,7 +508,7 @@ class MTeamScraper:
         )["data"]
 
     def scrape(self, mode: str, categories: list, page_range: range):
-
+        """Scrape torrents from the M-Team site and store them in the database."""
         contains_id = self.database.contains_id
         removesuffix = re.compile(r"\.torrent$", re.I).sub
 
@@ -530,7 +531,7 @@ class MTeamScraper:
 
                     date = strptime(detail["createdDate"])
                     if not date >= 0:
-                        logging.warning(f"Invalid creation date: '{date}'.")
+                        logger.warning(f"Invalid creation date: '{date}'.")
 
                     if get_int(detail, "numfiles") > 1:
                         files = tuple(
@@ -538,21 +539,21 @@ class MTeamScraper:
                             for f in self._get_files(tid)
                         )
                         if not all(f[1] and f[2] >= 0 for f in files):
-                            logging.warning(f"Invalid file path.")
+                            logger.warning(f"Invalid file path.")
                         length = sum(f[2] for f in files)
                     else:
                         files = ()
                         length = get_int(detail, "size")
 
                     if not length >= 0:
-                        logging.warning(f"Invalid torrent length: '{length}'.")
+                        logger.warning(f"Invalid torrent length: '{length}'.")
 
                     self.database.insert_torrent(
                         detail=(tid, title, name, date, length),
                         files=files,
                     )
                 except Exception as e:
-                    logging.error(f"Failed to process torrent '{tid}': {e}")
+                    logger.error(f"ID: '{tid}'. {e}")
 
 
 def get_int(d: dict, k) -> int:
@@ -587,18 +588,24 @@ def humansize(size: int) -> str:
     return f"{size:.2f} YiB"
 
 
-def config_logging(filename: str = "logfile.log"):
-    """Send messages to both the log file and stderr."""
-    # File handler
-    logging.basicConfig(
-        filename=join_root(filename),
-        format="[%(asctime)s] %(levelname)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M",
-    )
+def config_logger(logger: logging.Logger, logfile: Path = None):
+    """Configure logger to log to console and optionally to a file."""
+    logger.handlers.clear()
+
     # Console handler
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    logging.getLogger().addHandler(ch)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logger.addHandler(handler)
+
+    if logfile:
+        handler = logging.FileHandler(logfile)
+        handler.setFormatter(
+            logging.Formatter(
+                "[%(asctime)s] %(levelname)s: %(message)s",
+                datefmt="%Y-%m-%d %H:%M",
+            )
+        )
+        logger.addHandler(handler)
 
 
 def parse_args():
@@ -699,13 +706,13 @@ Examples:
     return parser.parse_args()
 
 
-def parse_config(config_path) -> dict:
+def parse_config(config_path: Path) -> dict:
     """Parse the JSON-formatted configuration file located at `config_path`."""
     config = {
         "api_key": "",
-        "domain": "https://kp.m-team.cc",
-        "hourlyLimit": 100,
-        "requestInterval": 10,
+        "domain": _DOMAIN,
+        "hourly_limit": 100,
+        "request_interval": 10,
         "mode_categories": [{"mode": "adult", "categories": []}],
     }
     try:
@@ -741,7 +748,7 @@ def _search(pattern: str, db: Database, search_mode: str, domain: str):
     f1 = "{:>5}: {}\n".format
     f2 = "{:>5}: {}  [{}]\n".format
     f3 = "{:>5}  {}  [{}]\n".format
-    url = urljoin(domain, "details.php")
+    detail_url = urljoin(domain, "detail")
     write = sys.stdout.write
 
     for s in results:
@@ -751,7 +758,7 @@ def _search(pattern: str, db: Database, search_mode: str, domain: str):
         write(f1("Date", strftime(s.date)))
         write(f1("Size", humansize(s.length)))
         write(f1("ID", s.id))
-        write(f1("URL", f"{url}?id={s.id}"))
+        write(f1("URL", f"{detail_url}/{s.id}"))
         if s.files:
             files = iter(s.files)
             p, l = next(files)
@@ -765,13 +772,15 @@ def _search(pattern: str, db: Database, search_mode: str, domain: str):
 
 
 def main():
-    config_logging()
     args = parse_args()
+    join_root = Path(__file__).parent.joinpath
     conf = parse_config(join_root("config.json"))
-    database = Database()
+    db = Database(join_root("data.db"))
     try:
+        domain = conf["domain"] or _DOMAIN
         if args.mode == "search":
-            param = (database, args.search_mode, conf["domain"])
+            config_logger(logger)
+            param = (db, args.search_mode, domain)
             if args.pattern:
                 _search(args.pattern, *param)
             else:
@@ -782,15 +791,16 @@ def main():
                         break
                     _search(pattern, *param)
         elif args.mode == "update":
+            config_logger(logger, join_root("logfile.log"))
             if args.nolimit:
-                ratelimiter = RateLimiter()
+                limiter = RateLimiter()
             else:
-                ratelimiter = RateLimiter(conf["hourlyLimit"], conf["requestInterval"])
+                limiter = RateLimiter(conf["hourly_limit"], conf["request_interval"])
             mt = MTeamScraper(
                 api_key=conf["api_key"],
-                domain=conf["domain"],
-                database=database,
-                ratelimiter=ratelimiter,
+                domain=domain,
+                database=db,
+                ratelimiter=limiter,
             )
             for m in conf["mode_categories"]:
                 mt.scrape(
@@ -800,12 +810,10 @@ def main():
                 )
         else:
             raise ValueError(f"Invalid operation mode: {args.mode}")
-    except LogException as e:
-        logging.error(e)
     except Exception as e:
-        stderr_write(f"Error: {e}\n")
+        logger.error(e)
     finally:
-        database.close()
+        db.close()
 
 
 if __name__ == "__main__":
