@@ -34,18 +34,22 @@ The script uses a configuration file (`config.json`) with the following fields:
 
 - `api_key`: API key for M-Team site.
 - `domain`: The URL of the M-Team site. Leave empty to use the default domain.
-- `hourly_limit`: Maximum number of requests in an hour. Set to 0 to disable.
 - `request_interval`: Time interval between each request in seconds. Set to 0 to disable.
-- `mode_categories`: List of modes and their subcategories to scrape. `mode` can be: `normal`, `adult`, `movie`, `music`, `tvshow`, `waterfall`, `rss`, `rankings`. `categories` is a list of integers where an empty list includes all subcategories.
+- `hourly_limit`: Maximum number of requests in an hour. Set to 0 to disable.
+- `nordvpn_path`: Path to the NordVPN executable, used to bypass throttling. Ensure the NordVPN client is installed. Typical paths are:
+  - **Windows**: `C:\Program Files\NordVPN\nordvpn.exe`
+  - **Linux**: `nordvpn`
+- `mode_categories`: List of modes and their subcategories to scrape. `mode` can be: `normal`, `adult`, `movie`, `music`, `tvshow`, `waterfall`, `rss`, `rankings`. `categories` is a list of integers representing the sub-categories of `mode`. An empty list includes all subcategories.
 
 Example Configuration:
 
 ```json
 {
     "api_key": "your_api_key_here",
-    "domain": null,
-    "hourly_limit": 100,
+    "domain": "",
     "request_interval": 10,
+    "hourly_limit": 0,
+    "nordvpn_path": "nordvpn",
     "mode_categories": [
         {
             "mode": "adult",
@@ -59,68 +63,70 @@ Example Configuration:
 }
 ```
 
-### Basic Command-Line Usage
+### Command-Line Usage
+
+#### For searching
 
 ```
-mtsearch.py [-h] [-s | -u] [-e | -f | -m] [-r PAGE_RANGE] [--dump DUMP_DIR] [--no-limit] [pattern]
+usage: mtsearch.py search [-h] [-e | -f | -m] [pattern]
 
-Operation Modes:
-  -h, --help       show this help message and exit
-  -s, --search     Search for a pattern in the database (default)
-  -u, --update     Update the database
+positional arguments:
+  pattern      specify the search pattern
 
-Search Options:
-  -e, --regex      Use regular expression matching
-  -f, --fixed      Use fixed-string matching (default)
-  -m, --fts        Use freeform SQLite FTS5 matching
-  pattern          Specify the search pattern
-
-Update options:
-  -r PAGE_RANGE    Specify page range as 'start-end', or 'end' (Default: 3)
-  --no-limit       Disable rate limit defined in the config file
+options:
+  -h, --help   show this help message and exit
+  -e, --regex  use regular expression matching
+  -f, --fixed  use fixed-string FTS5 matching (default)
+  -m, --fts    use freeform FTS5 matching
 ```
-
-### Examples (For searching)
 
 - Enter interactive search mode (use -e, -f, -m to specify search modes):
 
-  `mtsearch.py`
+  `mtsearch.py search` or `mtsearch.py s`
 
 - Search for a specific keyword (equivalent to using -f):
 
-  `mtsearch.py "foo"`
+  `mtsearch.py search "foo"`
 
 - Search using [FTS5](https://www.sqlite.org/fts5.html) syntax (without -m, the 'OR' operator is treated literally):
 
-  `mtsearch.py -m "foo OR bar"`
+  `mtsearch.py search -m "foo OR bar"`
 
 - Search using a regular expression (e.g., matches 2022, 2023, 2024):
 
-  `mtsearch.py -e "202[2-4]"`
+  `mtsearch.py search -e "202[2-4]"`
 
-### Examples (For updating)
+#### For updating
+
+```
+usage: mtsearch.py update [-h] [-c CACHE_DIR] [--no-limit] (-p [PAGES] | -i ID [ID ...] | --recreate)
+
+options:
+  -h, --help      show this help message and exit
+  -c CACHE_DIR    save torrent files to this directory
+  --no-limit      temporarily disable rate limiting
+
+actions:
+  -p [PAGES]      scrape one or more pages in 'page' or 'start-end' format (default: 1-3)
+  -i ID [ID ...]  update one or more torrent IDs
+  --recreate      recreate the database
+```
 
 - Scrape the 5 most recent pages, bypassing the rate limiter.
 
-  `mtsearch.py -u --no-limit -r 5`
+  `mtsearch.py update -p 1-5 --no-limit`
+
+- Scrape torrent ID 3, 5, and 7.
+
+  `mtsearch.py update -i 3 5 7`
 
 ## Data File
 
 A SQLite database named `data.db` will be created in the script's directory, storing all scraped torrent data. Ensure you back up this database as needed.
 
-## Notes:
+## API throttling:
 
-Currently, M-Team's website appears to implement two types of rate limiting:
-
-1. **Per-Request Interval**: Making 6 consecutive requests without a 20-second gap between each will result in a 120-second ban.
-2. **Global Limit**: There is a maximum number of requests allowed within a specific time window. Exceeding this limit will result in a 1-day ban.
-
-In this script, both types of rate limiting are addressed through the configuration file:
-
-- `"hourly_limit": 100` signifies that a maximum of 100 requests can be made within a 3600-second window.
-- `"request_interval": 20` implies that there should be a 20-second gap between each request.
-
-> **Note**: You're free to experiment with different settings of rate limits until you get banned. For scraping a small number of pages, use the `--no-limit` switch to temporarily disable the rate limiter.
+> **Note**: Currently, M-Team appears to implement API throttling dynamically. You're free to experiment with different settings of rate limiting until you get banned. For scraping a small number of pages, use the `--no-limit` switch to temporarily disable the rate limiter.
 
 ## Authors
 

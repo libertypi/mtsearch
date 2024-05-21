@@ -6,34 +6,14 @@ MTeam Scraper and Search Utility
 
 Description:
 ------------
-This script is a powerful utility for scraping torrent data from M-Team torrent
-sites and storing it in a local database for fast searching. It supports various
-search modes including fixed-string matching, SQLite FTS5 matching, and regular
-expression matching.
+This script is a utility for scraping torrent data from M-Team torrent sites and
+storing it in a local database for fast searching. It supports various search
+modes including SQLite FTS5 matching and regular expression matching.
 
 Main Functionality:
 -------------------
 1. Search for torrents in the local database.
 2. Update the local database by scraping new torrents from the website.
-
-Usage:
-------
-- For searching: `python mtsearch.py -s "search_query"`
-- For updating: `python mtsearch.py -u`
-
-Configuration File:
--------------------
-The script uses a configuration file (`config.json`) with the following fields:
-
-- `api_key`: API key for M-Team site.
-- `domain`: The URL of the M-Team site. Leave empty to use the default domain.
-- `hourly_limit`: Maximum number of requests in an hour. Set to 0 to disable.
-- `request_interval`: Time interval between each request in seconds. Set to 0 to
-  disable.
-- `mode_categories`: List of modes and their subcategories to scrape. `mode` can
-  be: `normal`, `adult`, `movie`, `music`, `tvshow`, `waterfall`, `rss`,
-  `rankings`. `categories` is a list of integers where an empty list includes
-  all subcategories.
 
 Authors:
 --------
@@ -46,8 +26,11 @@ import argparse
 import dataclasses
 import json
 import logging
+import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from collections import deque
@@ -59,17 +42,18 @@ from urllib.parse import urljoin
 
 import requests
 import urllib3
+from bencoder import bdecode  # bencoder.pyx
 
 logger = logging.getLogger(__name__)
-stderr_write = sys.stderr.write
 _DOMAIN = "https://kp.m-team.cc"
 
 
 @dataclasses.dataclass(frozen=True)
-class SearchResult:
-    """Data class to hold the result of a torrent search operation."""
+class Torrent:
+    """Data class to hold the details of a torrent."""
 
     id: int
+    category: int
     title: str
     name: str
     date: int
@@ -78,89 +62,99 @@ class SearchResult:
 
 
 class Database:
-    """
-    Database class for managing SQL operations related to torrents.
-    """
+    """Database class for managing SQL operations related to torrents."""
 
+    _sql_schema = """
+    BEGIN;
+
+    -- Create Main Tables
+    CREATE TABLE IF NOT EXISTS torrents(
+        id INTEGER PRIMARY KEY,
+        category INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        name TEXT NOT NULL,
+        date INTEGER NOT NULL,
+        length INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS files(
+        id INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        length INTEGER NOT NULL,
+        FOREIGN KEY(id) REFERENCES torrents(id)
+    );
+    CREATE TABLE IF NOT EXISTS categories(
+        id INTEGER PRIMARY KEY,
+        parent INTEGER,
+        nameChs TEXT,
+        nameCht TEXT,
+        nameEng TEXT
+    );
+
+    -- Create FTS Tables
+    CREATE VIRTUAL TABLE IF NOT EXISTS torrents_fts USING fts5(
+        category UNINDEXED,
+        title,
+        name,
+        date UNINDEXED,
+        length UNINDEXED,
+        content='torrents',
+        content_rowid='id'
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+        id UNINDEXED,
+        path,
+        length UNINDEXED,
+        content='files',
+        content_rowid='rowid'
+    );
+
+    -- Create Indexes
+    CREATE INDEX IF NOT EXISTS idx_files_id ON files(id);
+
+    -- Create Triggers for FTS
+    CREATE TRIGGER IF NOT EXISTS insert_torrents_fts AFTER INSERT ON torrents
+    BEGIN
+        INSERT INTO torrents_fts(rowid, category, title, name, date, length) VALUES (new.id, new.category, new.title, new.name, new.date, new.length);
+    END;
+    CREATE TRIGGER IF NOT EXISTS delete_torrents_fts AFTER DELETE ON torrents
+    BEGIN
+        INSERT INTO torrents_fts(torrents_fts, rowid, category, title, name, date, length) VALUES('delete', old.id, old.category, old.title, old.name, old.date, old.length);
+    END;
+    CREATE TRIGGER IF NOT EXISTS update_torrents_fts AFTER UPDATE ON torrents
+    BEGIN
+        INSERT INTO torrents_fts(torrents_fts, rowid, category, title, name, date, length) VALUES('delete', old.id, old.category, old.title, old.name, old.date, old.length);
+        INSERT INTO torrents_fts(rowid, category, title, name, date, length) VALUES (new.id, new.category, new.title, new.name, new.date, new.length);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS insert_files_fts AFTER INSERT ON files
+    BEGIN
+        INSERT INTO files_fts(rowid, id, path, length) VALUES (new.rowid, new.id, new.path, new.length);
+    END;
+    CREATE TRIGGER IF NOT EXISTS delete_files_fts AFTER DELETE ON files
+    BEGIN
+        INSERT INTO files_fts(files_fts, rowid, id, path, length) VALUES('delete', old.rowid, old.id, old.path, old.length);
+    END;
+    CREATE TRIGGER IF NOT EXISTS update_files_fts AFTER UPDATE ON files
+    BEGIN
+        INSERT INTO files_fts(files_fts, rowid, id, path, length) VALUES('delete', old.rowid, old.id, old.path, old.length);
+        INSERT INTO files_fts(rowid, id, path, length) VALUES (new.rowid, new.id, new.path, new.length);
+    END;
+
+    COMMIT;
+    """
+    _sql_ins_torrents = "INSERT INTO torrents (id, category, title, name, date, length) VALUES (?, ?, ?, ?, ?, ?)"
+    _sql_ins_files = "INSERT INTO files (id, path, length) VALUES (?, ?, ?)"
+    _sql_rpl_categories = "REPLACE INTO categories (id, parent, nameChs, nameCht, nameEng) VALUES (?, ?, ?, ?, ?)"
     not_regex = frozenset(r"[]{}().*?+\|^$").isdisjoint
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path):
         """Initialize the database."""
-        self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path)
+        self.db_path = Path(db_path)
+        self.conn = sqlite3.connect(db_path)
         self.c = self.conn.cursor()
 
         # Create tables and triggers
-        self.c.executescript(
-            """
-            BEGIN;
-
-            -- Create Main Tables
-            CREATE TABLE IF NOT EXISTS torrents(
-                id INTEGER PRIMARY KEY,
-                title TEXT NOT NULL,
-                name TEXT NOT NULL,
-                date INTEGER NOT NULL,
-                length INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS files(
-                id INTEGER NOT NULL,
-                path TEXT NOT NULL,
-                length INTEGER NOT NULL,
-                FOREIGN KEY(id) REFERENCES torrents(id)
-            );
-
-            -- Create FTS Tables
-            CREATE VIRTUAL TABLE IF NOT EXISTS torrents_fts USING fts5(
-                title,
-                name,
-                date UNINDEXED,
-                length UNINDEXED,
-                content='torrents',
-                content_rowid='id'
-            );
-            CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
-                id UNINDEXED,
-                path,
-                length UNINDEXED,
-                content='files',
-                content_rowid='rowid'
-            );
-
-            -- Create Indexes
-            CREATE INDEX IF NOT EXISTS idx_files_id ON files(id);
-
-            -- Create Triggers for FTS
-            CREATE TRIGGER IF NOT EXISTS insert_torrents_fts AFTER INSERT ON torrents
-            BEGIN
-                INSERT INTO torrents_fts(rowid, title, name, date, length) VALUES (new.id, new.title, new.name, new.date, new.length);
-            END;
-            CREATE TRIGGER IF NOT EXISTS delete_torrents_fts AFTER DELETE ON torrents
-            BEGIN
-                INSERT INTO torrents_fts(torrents_fts, rowid, title, name, date, length) VALUES('delete', old.id, old.title, old.name, old.date, old.length);
-            END;
-            CREATE TRIGGER IF NOT EXISTS update_torrents_fts AFTER UPDATE ON torrents
-            BEGIN
-                INSERT INTO torrents_fts(torrents_fts, rowid, title, name, date, length) VALUES('delete', old.id, old.title, old.name, old.date, old.length);
-                INSERT INTO torrents_fts(rowid, title, name, date, length) VALUES (new.id, new.title, new.name, new.date, new.length);
-            END;
-            CREATE TRIGGER IF NOT EXISTS insert_files_fts AFTER INSERT ON files
-            BEGIN
-                INSERT INTO files_fts(rowid, id, path, length) VALUES (new.rowid, new.id, new.path, new.length);
-            END;
-            CREATE TRIGGER IF NOT EXISTS delete_files_fts AFTER DELETE ON files
-            BEGIN
-                INSERT INTO files_fts(files_fts, rowid, id, path, length) VALUES('delete', old.rowid, old.id, old.path, old.length);
-            END;
-            CREATE TRIGGER IF NOT EXISTS update_files_fts AFTER UPDATE ON files
-            BEGIN
-                INSERT INTO files_fts(files_fts, rowid, id, path, length) VALUES('delete', old.rowid, old.id, old.path, old.length);
-                INSERT INTO files_fts(rowid, id, path, length) VALUES (new.rowid, new.id, new.path, new.length);
-            END;
-
-            COMMIT;
-            """
-        )
+        self.c.executescript(self._sql_schema)
 
     def __enter__(self):
         """Enable use of 'with' statement."""
@@ -175,33 +169,93 @@ class Database:
         self.c.execute("PRAGMA optimize")
         self.conn.close()
 
-    def contains_id(self, tid: int):
-        """Check if a torrent ID exists in the database."""
-        return bool(
-            self.c.execute(
-                "SELECT EXISTS(SELECT 1 FROM torrents WHERE id = ?)", (tid,)
-            ).fetchone()[0]
-        )
+    def update_categories(self, categories: tuple):
+        """Update or insert categories in the database."""
+        with self.conn:
+            self.c.executemany(self._sql_rpl_categories, categories)
+
+    def get_categories(self, column: str = "nameCht") -> dict:
+        """Retrieve a dictionary of category IDs to the corresponding names."""
+        return dict(self.c.execute(f"SELECT id, {column} FROM categories"))
 
     def get_total(self) -> int:
         """Get the total number of rows in the 'torrents' table."""
         return self.c.execute("SELECT COUNT(*) FROM torrents").fetchone()[0]
 
-    def insert_torrent(self, detail: tuple, files: tuple):
+    def torrent_exists(self, tid: int) -> bool:
+        """Check if a torrent ID exists in the database."""
+        return (
+            self.c.execute("SELECT 1 FROM torrents WHERE id = ?", (tid,)).fetchone()
+            is not None
+        )
+
+    def torrent_up2date(self, tid: int, category: int, title: str) -> bool:
+        """
+        True if the torrent exists, False otherwise. Updates the torrent if the
+        category or title has changed.
+        """
+        t = self.c.execute(
+            "SELECT category, title FROM torrents WHERE id = ?", (tid,)
+        ).fetchone()
+        if not t:
+            return False
+        if t[0] != category or t[1] != title:
+            logger.info(
+                "Updating %s. Category: '%s' -> '%s'. Title: '%s' -> %s.", tid,
+                t[0], category, t[1], title)  # fmt: skip
+            with self.conn:
+                self.c.execute(
+                    "UPDATE torrents SET category = ?, title = ? WHERE id = ?",
+                    (category, title, tid),
+                )
+        return True
+
+    def insert_torrent(self, torrent: tuple, files: tuple):
         """Insert the metadata of a new torrent into the database."""
         with self.conn:
-            self.c.execute(
-                "INSERT INTO torrents (id, title, name, date, length) VALUES (?, ?, ?, ?, ?)",
-                detail,
+            self.c.execute(self._sql_ins_torrents, torrent)
+            self.c.executemany(self._sql_ins_files, files)
+
+    def delete_torrent(self, tid: int):
+        """Delete the torrent from the database."""
+        with self.conn:
+            self.c.execute("DELETE FROM torrents WHERE id = ?", (tid,))
+            self.c.execute("DELETE FROM files WHERE id = ?", (tid,))
+
+    def recreate(self):
+        """
+        Create a new database by copying the contents of the current database,
+        and optimize the new database.
+        """
+        dest_path = self.db_path.with_stem(self.db_path.stem + "_new")
+        if dest_path.exists():
+            raise Exception(f"Destination exists: {dest_path}")
+
+        logger.info("Creating new database: %s", dest_path)
+        new_conn = sqlite3.connect(dest_path)
+        new_c = new_conn.cursor()
+
+        new_c.executescript(self._sql_schema)
+        with new_conn:
+            new_c.executemany(
+                self._sql_ins_torrents,
+                self.c.execute("SELECT * from torrents ORDER BY id"),
             )
-            self.c.executemany(
-                "INSERT INTO files (id, path, length) VALUES (?, ?, ?)",
-                files,
+            new_c.executemany(
+                self._sql_ins_files,
+                self.c.execute("SELECT * from files ORDER BY id, rowid"),
+            )
+            new_c.executemany(
+                self._sql_rpl_categories,
+                self.c.execute("SELECT * from categories ORDER BY id"),
             )
 
-    def search(
-        self, pattern: str, search_mode: str = "fixed"
-    ) -> Iterable[SearchResult]:
+        logger.info("Data copy completed. Optimizing...")
+        new_c.executescript("VACUUM; PRAGMA optimize; ANALYZE;")
+        logger.info("Database optimization completed.")
+        new_conn.close()
+
+    def search(self, pattern: str, search_mode: str = "fixed") -> Iterable[Torrent]:
         """
         Perform a search on the database based on the given pattern and search mode.
 
@@ -210,17 +264,23 @@ class Database:
             search_mode: The search mode, either 'fixed', 'fts', or 'regex'.
 
         Returns:
-            An iterable of SearchResult objects.
+            An iterable of Torrent objects.
         """
 
         # Full-Text Search (FTS) based search
         if search_mode in ("fixed", "fts"):
             return self._common_search(
-                q1="SELECT rowid, title, name, date, length FROM torrents_fts WHERE title MATCH :pat OR name MATCH :pat",
-                q2="""SELECT torrents.id, torrents.title, torrents.name, torrents.date, torrents.length, files_fts.path, files_fts.length
-                      FROM files_fts
-                      JOIN torrents ON files_fts.id = torrents.id
-                      WHERE files_fts.path MATCH :pat""",
+                q1="""
+                SELECT rowid, *
+                FROM torrents_fts
+                WHERE title MATCH :pat OR name MATCH :pat
+                """,
+                q2="""
+                SELECT files_fts.path, files_fts.length, torrents.*
+                FROM files_fts
+                JOIN torrents ON files_fts.id = torrents.id
+                WHERE files_fts.path MATCH :pat
+                """,
                 param={"pat": f'"{pattern}"' if search_mode == "fixed" else pattern},
                 c=self.c,
             ).values()
@@ -230,20 +290,27 @@ class Database:
             if self.not_regex(pattern):
                 m = re.search(r"[^\W_]+", pattern)
                 if not m:
+                    # Pattern is non-word, skip converting
                     pass
-                # If pattern is a simple word, use LIKE matching
                 elif m[0] == pattern:
+                    # Pattern is a simple word, use LIKE matching
                     return self._common_search(
-                        q1="SELECT id, title, name, date, length FROM torrents WHERE title LIKE :pat OR name LIKE :pat",
-                        q2="""SELECT torrents.id, torrents.title, torrents.name, torrents.date, torrents.length, files.path, files.length
-                              FROM files
-                              JOIN torrents ON files.id = torrents.id
-                              WHERE files.path LIKE :pat""",
+                        q1="""
+                        SELECT *
+                        FROM torrents
+                        WHERE title LIKE :pat OR name LIKE :pat
+                        """,
+                        q2="""
+                        SELECT files.path, files.length, torrents.*
+                        FROM files
+                        JOIN torrents ON files.id = torrents.id
+                        WHERE files.path LIKE :pat
+                        """,
                         param={"pat": f"%{pattern}%"},
                         c=self.c,
                     ).values()
-                # Convert pattern to a fuzzy regex
                 else:
+                    # Convert pattern to a fuzzy regex
                     pattern = re.sub(r"[\W_]+", r"[\\W_]*", pattern)
             return self._regex_search(pattern).values()
 
@@ -305,13 +372,17 @@ class Database:
 
         # Perform the regex search using the common search method and close the connection.
         result = Database._common_search(
-            q1="""SELECT id, title, name, date, length FROM torrents
-                WHERE id BETWEEN ? AND ?
-                AND (RESEARCH(title) OR RESEARCH(name))""",
-            q2="""SELECT torrents.id, torrents.title, torrents.name, torrents.date, torrents.length, files.path, files.length
-                FROM files
-                JOIN torrents ON files.id = torrents.id
-                WHERE files.id BETWEEN ? AND ? AND RESEARCH(files.path)""",
+            q1="""
+            SELECT * FROM torrents
+            WHERE id BETWEEN ? AND ?
+            AND (RESEARCH(title) OR RESEARCH(name))
+            """,
+            q2="""
+            SELECT files.path, files.length, torrents.*
+            FROM files
+            JOIN torrents ON files.id = torrents.id
+            WHERE files.id BETWEEN ? AND ? AND RESEARCH(files.path)
+            """,
             param=(start_id, end_id),
             c=conn.cursor(),
         )
@@ -331,16 +402,16 @@ class Database:
             c: SQLite cursor object.
 
         Returns:
-            A dictionary of SearchResult objects.
+            A dictionary of Torrent objects.
         """
         result = {}
-        for tid, title, name, date, total in c.execute(q1, param):
-            result[tid] = SearchResult(tid, title, name, date, total)
-        for tid, title, name, date, total, path, length in c.execute(q2, param):
-            v = result.get(tid)
-            if v is None:
-                v = result[tid] = SearchResult(tid, title, name, date, total)
-            v.files.append((path, length))
+        for tid, *torrent in c.execute(q1, param):
+            result[tid] = Torrent(tid, *torrent)
+        for path, length, tid, *torrent in c.execute(q2, param):
+            t = result.get(tid)
+            if t is None:
+                t = result[tid] = Torrent(tid, *torrent)
+            t.files.append((path, length))
         return result
 
 
@@ -350,13 +421,13 @@ class RateLimiter:
     non-positive values disable the corresponding rate limit.
 
     Parameters:
-     - hourly_limit: The maximum number of requests allowed in an hour for
-       global rate limiting.
      - request_interval: The minimum time interval (in seconds) between
        consecutive requests for per-request rate limiting.
+     - hourly_limit: The maximum number of requests allowed in an hour for
+       global rate limiting.
     """
 
-    def __init__(self, hourly_limit: int = None, request_interval: int = None):
+    def __init__(self, request_interval: int = None, hourly_limit: int = None):
         self._waitlist = []
         self.request_que = deque()
         self.last_request = 0
@@ -382,8 +453,8 @@ class RateLimiter:
 
         if len(que) >= self.hourly_limit:
             sleep = que[0] - oldest_allowed
-            stderr_write(
-                f"Global rate limit reached. Waiting for {sleep:.2f} seconds. Hourly limit: {self.hourly_limit}.\n"
+            logger.info(
+                f"Waiting for {sleep:.2f}s. Hourly limit: {self.hourly_limit}s."
             )
             time.sleep(sleep)
 
@@ -391,8 +462,8 @@ class RateLimiter:
         """Per-request rate limiting logic."""
         sleep = self.request_interval - time.time() + self.last_request
         if sleep > 0:
-            stderr_write(
-                f"Waiting for {sleep:.2f}s. Request interval: {self.request_interval:.2f} seconds.\n"
+            logger.info(
+                f"Waiting for {sleep:.2f}s. Request interval: {self.request_interval:.2f}s."
             )
             time.sleep(sleep)
 
@@ -409,11 +480,27 @@ class RateLimiter:
             self.request_que.append(self.last_request)
 
 
+class APIError(Exception):
+    """Exception for API errors."""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
+
+
+class CriticalAPIError(APIError):
+    """Exception for critical API errors."""
+
+    pass
+
+
 class MTeamScraper:
     """A scraper for downloading torrent information from M-Team."""
 
-    _pageSize = 100
-    _sleep = 120
+    _page_size: int = 200
+    _throttle_timer: int = 120
+    _nord_cmd: tuple = None
+    _cache_dir: Path = None
 
     def __init__(
         self,
@@ -421,18 +508,43 @@ class MTeamScraper:
         domain: str,
         database: Database,
         ratelimiter: RateLimiter,
+        nordvpn_path: str = None,
+        cache_dir: str = None,
     ):
-        """Initializes the MTeamScraper instance."""
+        """Initialize the MTeamScraper instance."""
         if not api_key:
             raise ValueError("api_key is null.")
         self.api_key = api_key
 
-        self._search_url = urljoin(domain, "/api/torrent/search")
-        self._detail_url = urljoin(domain, "/api/torrent/detail")
-        self._files_url = urljoin(domain, "/api/torrent/files")
+        self._domain = domain or _DOMAIN
+        self._url_cache = {}
 
         self.database = database
         self.ratelimiter = ratelimiter
+
+        # Setup NordVPN
+        if nordvpn_path:
+            nordvpn_path = shutil.which(nordvpn_path)
+            if nordvpn_path:
+                self._nord_cmd = (
+                    nordvpn_path,
+                    "--connect" if os.name == "nt" else "connect",
+                )
+            else:
+                logger.warning("NordVPN not found. VPN switching will be disabled.")
+
+        # Setup cache directory
+        self._fetch_torrent = self._download_torrent
+        if cache_dir:
+            try:
+                cache_dir = Path(cache_dir)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.error("Unable to access cache directory: %s", e)
+            else:
+                self._cache_dir = cache_dir
+                self._fetch_torrent = self._cache_torrent
+
         self._init_session()
 
     def _init_session(self):
@@ -450,114 +562,233 @@ class MTeamScraper:
         s.headers.update(
             {
                 "x-api-key": self.api_key,
-                "User-Agent": "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.",
             }
         )
 
-    def _request_json(self, url: str, **kwargs) -> dict:
-        """Make a POST request and handle rate limiting and retries."""
+    def update_categories(self):
+        """Update categories in the database."""
+        try:
+            categories = self._request_api(
+                "/api/torrent/categoryList",
+                ratelimit=False,
+            )["data"]["list"]
+            categories = tuple(
+                (
+                    int(d["id"]),
+                    int(d["parent"]) if d["parent"] else None,
+                    d["nameChs"],
+                    d["nameCht"],
+                    d["nameEng"],
+                )
+                for d in categories
+            )
+            self.database.update_categories(categories)
+        except CriticalAPIError:
+            raise
+        except Exception as e:
+            logger.error("Failed to update categories: %s", e)
+
+    def from_search(self, mode: str, categories: list, pages: Iterable[int]):
+        """Update the database from the `search` API."""
+        self._process_scrape(self._scrape_search(mode, categories, pages))
+
+    def from_detail(self, tids: Iterable[int]):
+        """Update the database from the `detail` API."""
+        self._process_scrape(self._scrape_detail(tids))
+
+    def _scrape_search(self, mode: str, categories: list, pages: Iterable[int]):
+        """Retrieve data from the `search` API."""
+        for p in pages:
+            yield from self._request_api(
+                api_path="/api/torrent/search",
+                ratelimit=False,
+                headers={"Content-Type": "application/json"},
+                json={
+                    "mode": mode,
+                    "categories": categories or (),
+                    "pageNumber": p,
+                    "pageSize": self._page_size,
+                },
+            )["data"]["data"]
+
+    def _scrape_detail(self, tids: Iterable[int]):
+        """Retrieve data from the `detail` API."""
+        for tid in tids:
+            try:
+                yield self._request_api(
+                    api_path="/api/torrent/detail",
+                    data={"id": tid},
+                )["data"]
+            except CriticalAPIError:
+                raise
+            except APIError as e:
+                if "種子未找到" in e.message and self.database.torrent_exists(tid):
+                    logger.info("Remove torrent: %s. (%s)", tid, e.message)
+                    self.database.delete_torrent(tid)
+                else:
+                    logger.error("ID: %s. %s", tid, e)
+            except Exception as e:
+                logger.error("ID: %s. %s", tid, e)
+
+    def _process_scrape(self, items: Iterable[dict]):
+        """Process and update the database with the provided scrape results."""
+        torrent_up2date = self.database.torrent_up2date
+        join = b"/".join
+
+        for item in items:
+            try:
+                tid = int(item["id"])
+                # title
+                title = item["name"].strip()
+                if not (isinstance(title, str) and title):
+                    raise ValueError(f"Invalid title '{title}'.")
+                # category
+                category = get_int(item, "category")
+                if category <= 0:
+                    logger.error("ID: %s. Invalid category: '%s'.", tid, category)
+                # check and update existing torrent
+                if torrent_up2date(tid, category, title):
+                    continue
+                # download and decode the torrent
+                data = bdecode(self._fetch_torrent(tid))
+                # date
+                date = get_int(data, b"creation date")
+                if date <= 0:
+                    date = strptime(item["createdDate"])
+                    if date <= 0:
+                        logger.error("ID: %s. Invalid creation date: '%s'.", tid, date)
+                # name
+                data = data[b"info"]
+                k = b"name.utf-8" if b"name.utf-8" in data else b"name"
+                name = data[k].decode(errors="ignore").strip()
+                if not (isinstance(name, str) and name):
+                    raise ValueError(f"Invalid name '{name}'.")
+                # files & length
+                files = data.get(b"files")
+                if files:
+                    k = b"path.utf-8" if b"path.utf-8" in files[0] else b"path"
+                    files = tuple(
+                        (tid, join(f[k]).decode(errors="ignore"), get_int(f, b"length"))
+                        for f in files
+                    )
+                    if not all(f[1] and f[2] >= 0 for f in files):
+                        logger.error("ID: %s. Invalid file path.", tid)
+                    length = sum(f[2] for f in files)
+                else:
+                    files = ()
+                    length = get_int(data, b"length")
+                if length <= 0:
+                    length = get_int(item, "size")
+                    if length <= 0:
+                        logger.error(
+                            "ID: %s. Invalid torrent length: '%s'.", tid, length
+                        )
+                # insert into the database
+                self.database.insert_torrent(
+                    torrent=(tid, category, title, name, date, length),
+                    files=files,
+                )
+            except CriticalAPIError:
+                raise
+            except Exception as e:
+                logger.error("ID: %s. %s", item.get("id"), e)
+
+    def _request_api(
+        self,
+        api_path: str,
+        ratelimit: bool = True,
+        headers: dict = {"Content-Type": "application/x-www-form-urlencoded"},
+        **kwargs,
+    ):
+        """Make a POST request to the API and return JSON response."""
+        try:
+            url = self._url_cache[api_path]
+        except KeyError:
+            url = self._url_cache[api_path] = urljoin(self._domain, api_path)
+
+        logger.info(
+            "Requesting: %s. Payload: %s", url, kwargs.get("data") or kwargs.get("json")
+        )
         while True:
-            with self.ratelimiter:
-                stderr_write(f"Connecting: {url}\n")
-                for k in "json", "data":
-                    if k in kwargs:
-                        stderr_write(f"  {kwargs[k]}\n")
-                res = self.session.post(url=url, **kwargs)
+            if ratelimit:
+                with self.ratelimiter:
+                    res = self.session.post(url, headers=headers, **kwargs)
+            else:
+                res = self.session.post(url, headers=headers, **kwargs)
             res.raise_for_status()
             res = res.json()
 
             message = res["message"]
             if "SUCCESS" in message.upper():
                 return res
-            elif "請求過於頻繁" in message:
-                stderr_write(f"Throttled. Waiting for {self._sleep} seconds.\n")
-                time.sleep(self._sleep)
-            elif "key無效" in message:
-                raise Exception("Invalid API key. Check credential in config file.")
+            self._handle_api_errs(message)
+
+    def _handle_api_errs(self, message: str):
+        """
+        Handle API error messages. This method is to be used within a loop to
+        manage throttling and retries.
+        """
+        if "請求過於頻繁" in message:
+            if self._nord_cmd:
+                logger.info("Throttled. Switching NordVPN. (%s)", message)
+                subprocess.run(self._nord_cmd)
+                self._init_session()
             else:
-                raise Exception(message)
+                logger.info(
+                    "Throttled. Waiting for %ss. (%s)", self._throttle_timer, message
+                )
+                time.sleep(self._throttle_timer)
+        elif "key無效" in message:
+            raise CriticalAPIError(f"Invalid API key. ({message})")
+        else:
+            raise APIError(message)
 
-    def _get_list(self, mode: str, categories: list, page: int) -> list:
-        """Get a list of torrents from the M-Team API."""
-        return self._request_json(
-            url=self._search_url,
-            headers={"Content-Type": "application/json"},
-            json={
-                "mode": mode,
-                "categories": categories or (),
-                "pageNumber": page + 1,
-                "pageSize": self._pageSize,
-                "visible": 0,
-            },
-        )["data"]["data"]
-
-    def _get_detail(self, tid: int):
-        """Get details of a specific torrent."""
-        return self._request_json(
-            url=self._detail_url,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+    def _download_torrent(self, tid: int) -> bytes:
+        """Download the torrent file for a given torrent ID."""
+        url = self._request_api(
+            api_path="/api/torrent/genDlToken",
+            ratelimit=False,
             data={"id": tid},
         )["data"]
 
-    def _get_files(self, tid: int):
-        """Get files of a specific torrent."""
-        return self._request_json(
-            url=self._files_url,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            data={"id": tid},
-        )["data"]
+        logger.info("Downloading torrent: %s", tid)
+        while True:
+            with self.ratelimiter:
+                res = self.session.get(url)
+            res.raise_for_status()
+            # JSON responses indicate error
+            if "application/json" in res.headers.get("Content-Type", "").lower():
+                message = res.json()["message"]
+                if "下載配額用盡" in message:
+                    raise CriticalAPIError(f"Download quota exhausted. ({message})")
+                self._handle_api_errs(message)
+            else:
+                return res.content
 
-    def scrape(self, mode: str, categories: list, page_range: range):
-        """Scrape torrents from the M-Team site and store them in the database."""
-        contains_id = self.database.contains_id
-        removesuffix = re.compile(r"\.torrent$", re.I).sub
-
-        for page in page_range:
-            for item in self._get_list(mode, categories, page):
-                tid = item.get("id")
-                try:
-                    tid = int(tid)
-                    if contains_id(tid):
-                        continue
-                    detail = self._get_detail(tid)
-
-                    title = detail["name"]
-                    if not (isinstance(title, str) and title):
-                        raise ValueError(f"Invalid title '{title}'.")
-
-                    name = removesuffix("", detail["originFileName"], 1)
-                    if not name:
-                        raise ValueError("Empty torrent name.")
-
-                    date = strptime(detail["createdDate"])
-                    if not date >= 0:
-                        logger.warning(f"Invalid creation date: '{date}'.")
-
-                    if get_int(detail, "numfiles") > 1:
-                        files = tuple(
-                            (tid, f["name"], get_int(f, "size"))
-                            for f in self._get_files(tid)
-                        )
-                        if not all(f[1] and f[2] >= 0 for f in files):
-                            logger.warning(f"Invalid file path.")
-                        length = sum(f[2] for f in files)
-                    else:
-                        files = ()
-                        length = get_int(detail, "size")
-
-                    if not length >= 0:
-                        logger.warning(f"Invalid torrent length: '{length}'.")
-
-                    self.database.insert_torrent(
-                        detail=(tid, title, name, date, length),
-                        files=files,
-                    )
-                except Exception as e:
-                    logger.error(f"ID: '{tid}'. {e}")
+    def _cache_torrent(self, tid: int):
+        """Download and cache the torrent file."""
+        file = self._cache_dir.joinpath(f"{tid}.torrent")
+        if file.exists():
+            logger.info("Using cache: %s", file.name)
+            try:
+                return file.read_bytes()
+            except Exception as e:
+                logger.warning(e)
+        content = self._download_torrent(tid)
+        try:
+            file.write_bytes(content)
+        except Exception as e:
+            logger.error(e)
+            try:
+                os.unlink(file)
+            except Exception:
+                pass
+        return content
 
 
 def get_int(d: dict, k) -> int:
-    """Returns the integer value for key k in dict d, or 0 if invalid."""
+    """Return the integer value for key k in dict d, or 0 if invalid."""
     try:
         return int(d[k])
     except (KeyError, TypeError, ValueError):
@@ -588,9 +819,10 @@ def humansize(size: int) -> str:
     return f"{size:.2f} YiB"
 
 
-def config_logger(logger: logging.Logger, logfile: Path = None):
+def config_logger(logger: logging.Logger = logger, logfile: Path = None):
     """Configure logger to log to console and optionally to a file."""
     logger.handlers.clear()
+    logger.setLevel(logging.INFO)
 
     # Console handler
     handler = logging.StreamHandler()
@@ -605,64 +837,61 @@ def config_logger(logger: logging.Logger, logfile: Path = None):
                 datefmt="%Y-%m-%d %H:%M",
             )
         )
+        handler.setLevel(logging.ERROR)
         logger.addHandler(handler)
 
 
 def parse_args():
-    def parse_range(range_str: str):
-        m = re.fullmatch(r"(?:(\d+)-)?(\d+)", range_str)
+    def parse_range(string: str):
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", string)
         if m:
-            return range(int(m[1] or 0), int(m[2]))
+            return range(int(m[1]), int(m[2] or m[1]) + 1)
         raise argparse.ArgumentTypeError(
-            "Invalid range format. Use 'start-end' or 'end'."
+            "Invalid range format. Use 'page' or 'start-end'."
         )
 
     parser = argparse.ArgumentParser(
         description="""\
-A Powerful MTeam Scraper and Search Utility.
+A M-Team scraper and search utility.
 
-Scrapes torrent data from M-Team torrent sites and stores it in a local SQLite
-database. Supports various search modes including fixed-string matching, SQLite
-FTS5 matching, and regular expression matching.
+Scrapes torrent data from M-Team website and stores it in a local database.
+Supports SQLite FTS5 and regular expression matching.
 
 Author: David Pi
 Contributor: ChatGPT - OpenAI""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(title="mode", required=True)
+
+    # search
+    subparser = subparsers.add_parser(
+        "search",
+        aliases=("s",),
+        help="search for patterns",
         epilog="""\
-Examples:
-  %(prog)s -m "girl OR woman"
-  %(prog)s -u -r 5-10
+examples:
+  %(prog)s "foo"
+  %(prog)s -m "foo OR bar"
+  %(prog)s -e "202[2-4]"
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-
-    exgroup = parser.add_mutually_exclusive_group()
-    exgroup.add_argument(
-        "-s",
-        "--search",
-        dest="mode",
-        action="store_const",
-        const="search",
-        help="Search for a pattern in the database (default)",
+    subparser.set_defaults(mode="search")
+    subparser.add_argument(
+        "pattern",
+        action="store",
+        nargs="?",
+        help="specify the search pattern",
     )
-    exgroup.add_argument(
-        "-u",
-        "--update",
-        dest="mode",
-        action="store_const",
-        const="update",
-        help="Update the database",
-    )
-    exgroup.set_defaults(mode="search")
-
-    group = parser.add_argument_group("Search Options")
-    exgroup = group.add_mutually_exclusive_group()
+    exgroup = subparser.add_mutually_exclusive_group()
+    exgroup.set_defaults(search_mode="fixed")
     exgroup.add_argument(
         "-e",
         "--regex",
         dest="search_mode",
         action="store_const",
         const="regex",
-        help="Use regular expression matching",
+        help="use regular expression matching",
     )
     exgroup.add_argument(
         "-f",
@@ -670,7 +899,7 @@ Examples:
         dest="search_mode",
         action="store_const",
         const="fixed",
-        help="Use fixed-string matching (default)",
+        help="use fixed-string FTS5 matching (default)",
     )
     exgroup.add_argument(
         "-m",
@@ -678,29 +907,55 @@ Examples:
         dest="search_mode",
         action="store_const",
         const="fts",
-        help="Use freeform SQLite FTS5 matching",
-    )
-    exgroup.set_defaults(search_mode="fixed")
-    group.add_argument(
-        "pattern",
-        action="store",
-        nargs="?",
-        help="Specify the search pattern",
+        help="use freeform FTS5 matching",
     )
 
-    group = parser.add_argument_group("Update options")
-    group.add_argument(
-        "-r",
-        dest="page_range",
-        type=parse_range,
-        default="3",
-        help="Specify page range as 'start-end', or 'end' (Default: %(default)s)",
+    # update
+    subparser = subparsers.add_parser(
+        "update",
+        aliases=("u",),
+        help="update the database",
+        epilog="""\
+examples:
+  %(prog)s -p 1-10
+  %(prog)s -i 3 5 7
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    group.add_argument(
+    subparser.set_defaults(mode="update")
+    subparser.add_argument(
+        "-c",
+        dest="cache_dir",
+        help="save torrent files to this directory",
+    )
+    subparser.add_argument(
         "--no-limit",
-        dest="nolimit",
+        dest="no_limit",
         action="store_true",
-        help="Disable rate limit defined in the config file",
+        help="temporarily disable rate limiting",
+    )
+    exgroup = subparser.add_argument_group("actions")
+    exgroup = exgroup.add_mutually_exclusive_group(required=True)
+    exgroup.add_argument(
+        "-p",
+        dest="pages",
+        type=parse_range,
+        const="1-3",
+        nargs="?",
+        help="scrape one or more pages in 'page' or 'start-end' format (default: %(const)s)",
+    )
+    exgroup.add_argument(
+        "-i",
+        dest="id",
+        type=int,
+        nargs="+",
+        help="update one or more torrent IDs",
+    )
+    exgroup.add_argument(
+        "--recreate",
+        dest="recreate",
+        action="store_true",
+        help="recreate the database",
     )
 
     return parser.parse_args()
@@ -711,8 +966,9 @@ def parse_config(config_path: Path) -> dict:
     config = {
         "api_key": "",
         "domain": _DOMAIN,
-        "hourly_limit": 100,
         "request_interval": 10,
+        "hourly_limit": 0,
+        "nordvpn_path": "",
         "mode_categories": [{"mode": "adult", "categories": []}],
     }
     try:
@@ -722,16 +978,12 @@ def parse_config(config_path: Path) -> dict:
     except FileNotFoundError:
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
-        stderr_write(
+        sys.exit(
             f"A blank configuration file has been created at '{config_path}'. "
-            "Edit the settings before running this script again.\n"
+            "Edit the settings before running this script again."
         )
     except json.JSONDecodeError:
-        stderr_write(
-            f"The configuration file at '{config_path}' is malformed. "
-            "Please fix the JSON syntax.\n"
-        )
-    sys.exit(1)
+        sys.exit(f"The configuration file at '{config_path}' is malformed.")
 
 
 def _search(pattern: str, db: Database, search_mode: str, domain: str):
@@ -748,19 +1000,21 @@ def _search(pattern: str, db: Database, search_mode: str, domain: str):
     f1 = "{:>5}: {}\n".format
     f2 = "{:>5}: {}  [{}]\n".format
     f3 = "{:>5}  {}  [{}]\n".format
-    detail_url = urljoin(domain, "detail")
     write = sys.stdout.write
+    cat_get = db.get_categories().get
+    detail_url = urljoin(domain or _DOMAIN, "detail/")
 
-    for s in results:
+    for t in results:
         write(sep)
-        write(f1("Title", s.title))
-        write(f1("Name", s.name))
-        write(f1("Date", strftime(s.date)))
-        write(f1("Size", humansize(s.length)))
-        write(f1("ID", s.id))
-        write(f1("URL", f"{detail_url}/{s.id}"))
-        if s.files:
-            files = iter(s.files)
+        write(f1("ID", t.id))
+        write(f1("Cat", cat_get(t.category, "Unknown")))
+        write(f1("Title", t.title))
+        write(f1("Name", t.name))
+        write(f1("Date", strftime(t.date)))
+        write(f1("Size", humansize(t.length)))
+        write(f1("URL", f"{detail_url}{t.id}"))
+        if t.files:
+            files = iter(t.files)
             p, l = next(files)
             write(f2("Files", p, humansize(l)))
             for p, l in files:
@@ -772,15 +1026,17 @@ def _search(pattern: str, db: Database, search_mode: str, domain: str):
 
 
 def main():
+
     args = parse_args()
     join_root = Path(__file__).parent.joinpath
     conf = parse_config(join_root("config.json"))
+
     db = Database(join_root("data.db"))
     try:
-        domain = conf["domain"] or _DOMAIN
         if args.mode == "search":
-            config_logger(logger)
-            param = (db, args.search_mode, domain)
+            config_logger()
+
+            param = (db, args.search_mode, conf["domain"])
             if args.pattern:
                 _search(args.pattern, *param)
             else:
@@ -790,28 +1046,38 @@ def main():
                     if not pattern:
                         break
                     _search(pattern, *param)
+
         elif args.mode == "update":
-            config_logger(logger, join_root("logfile.log"))
-            if args.nolimit:
+            config_logger(logfile=join_root("logfile.log"))
+
+            if args.recreate:
+                db.recreate()
+                return
+            if args.no_limit:
                 limiter = RateLimiter()
             else:
-                limiter = RateLimiter(conf["hourly_limit"], conf["request_interval"])
+                limiter = RateLimiter(conf["request_interval"], conf["hourly_limit"])
             mt = MTeamScraper(
                 api_key=conf["api_key"],
-                domain=domain,
+                domain=conf["domain"],
                 database=db,
                 ratelimiter=limiter,
+                nordvpn_path=conf["nordvpn_path"],
+                cache_dir=args.cache_dir,
             )
-            for m in conf["mode_categories"]:
-                mt.scrape(
-                    mode=m["mode"],
-                    categories=m["categories"],
-                    page_range=args.page_range,
-                )
-        else:
-            raise ValueError(f"Invalid operation mode: {args.mode}")
+            mt.update_categories()
+            if args.pages:
+                for m in conf["mode_categories"]:
+                    mt.from_search(
+                        mode=m["mode"],
+                        categories=m["categories"],
+                        pages=args.pages,
+                    )
+            elif args.id:
+                mt.from_detail(tids=args.id)
+
     except Exception as e:
-        logger.error(e)
+        logger.critical(e)
     finally:
         db.close()
 

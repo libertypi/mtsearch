@@ -1,5 +1,6 @@
 .vscode
 *.db
+*.log
 config.*
 
 # Byte-compiled / optimized / DLL files
