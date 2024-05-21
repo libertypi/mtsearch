@@ -44,8 +44,8 @@ import requests
 import urllib3
 from bencoder import bdecode  # bencoder.pyx
 
-logger = logging.getLogger(__name__)
 _DOMAIN = "https://kp.m-team.cc"
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,7 +144,20 @@ class Database:
     """
     _sql_ins_torrents = "INSERT INTO torrents (id, category, title, name, date, length) VALUES (?, ?, ?, ?, ?, ?)"
     _sql_ins_files = "INSERT INTO files (id, path, length) VALUES (?, ?, ?)"
-    _sql_rpl_categories = "REPLACE INTO categories (id, parent, nameChs, nameCht, nameEng) VALUES (?, ?, ?, ?, ?)"
+    _sql_upd_categories = """
+    INSERT INTO categories (id, parent, nameChs, nameCht, nameEng)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+        parent = excluded.parent,
+        nameChs = excluded.nameChs,
+        nameCht = excluded.nameCht,
+        nameEng = excluded.nameEng
+    WHERE
+        categories.parent != excluded.parent OR
+        categories.nameChs != excluded.nameChs OR
+        categories.nameCht != excluded.nameCht OR
+        categories.nameEng != excluded.nameEng
+    """
     not_regex = frozenset(r"[]{}().*?+\|^$").isdisjoint
 
     def __init__(self, db_path):
@@ -170,9 +183,9 @@ class Database:
         self.conn.close()
 
     def update_categories(self, categories: tuple):
-        """Update or insert categories in the database."""
+        """Update categories when there is a real change."""
         with self.conn:
-            self.c.executemany(self._sql_rpl_categories, categories)
+            self.c.executemany(self._sql_upd_categories, categories)
 
     def get_categories(self, column: str = "nameCht") -> dict:
         """Retrieve a dictionary of category IDs to the corresponding names."""
@@ -223,10 +236,7 @@ class Database:
             self.c.execute("DELETE FROM files WHERE id = ?", (tid,))
 
     def recreate(self):
-        """
-        Create a new database by copying the contents of the current database,
-        and optimize the new database.
-        """
+        """Create a new database and insert the current data."""
         dest_path = self.db_path.with_stem(self.db_path.stem + "_new")
         if dest_path.exists():
             raise Exception(f"Destination exists: {dest_path}")
@@ -246,11 +256,11 @@ class Database:
                 self.c.execute("SELECT * from files ORDER BY id, rowid"),
             )
             new_c.executemany(
-                self._sql_rpl_categories,
+                self._sql_upd_categories,
                 self.c.execute("SELECT * from categories ORDER BY id"),
             )
 
-        logger.info("Data copy completed. Optimizing...")
+        logger.info("Data copying completed. Optimizing...")
         new_c.executescript("VACUUM; PRAGMA optimize; ANALYZE;")
         logger.info("Database optimization completed.")
         new_conn.close()
@@ -570,7 +580,7 @@ class MTeamScraper:
         """Update categories in the database."""
         try:
             categories = self._request_api(
-                "/api/torrent/categoryList",
+                path="/api/torrent/categoryList",
                 ratelimit=False,
             )["data"]["list"]
             categories = tuple(
@@ -601,7 +611,7 @@ class MTeamScraper:
         """Retrieve data from the `search` API."""
         for p in pages:
             yield from self._request_api(
-                api_path="/api/torrent/search",
+                path="/api/torrent/search",
                 ratelimit=False,
                 headers={"Content-Type": "application/json"},
                 json={
@@ -617,7 +627,7 @@ class MTeamScraper:
         for tid in tids:
             try:
                 yield self._request_api(
-                    api_path="/api/torrent/detail",
+                    path="/api/torrent/detail",
                     data={"id": tid},
                 )["data"]
             except CriticalAPIError:
@@ -696,16 +706,16 @@ class MTeamScraper:
 
     def _request_api(
         self,
-        api_path: str,
+        path: str,
         ratelimit: bool = True,
         headers: dict = {"Content-Type": "application/x-www-form-urlencoded"},
         **kwargs,
     ):
         """Make a POST request to the API and return JSON response."""
         try:
-            url = self._url_cache[api_path]
+            url = self._url_cache[path]
         except KeyError:
-            url = self._url_cache[api_path] = urljoin(self._domain, api_path)
+            url = self._url_cache[path] = urljoin(self._domain, path)
 
         logger.info(
             "Requesting: %s. Payload: %s", url, kwargs.get("data") or kwargs.get("json")
@@ -747,7 +757,7 @@ class MTeamScraper:
     def _download_torrent(self, tid: int) -> bytes:
         """Download the torrent file for a given torrent ID."""
         url = self._request_api(
-            api_path="/api/torrent/genDlToken",
+            path="/api/torrent/genDlToken",
             ratelimit=False,
             data={"id": tid},
         )["data"]
