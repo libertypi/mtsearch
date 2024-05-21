@@ -599,27 +599,24 @@ class MTeamScraper:
         except Exception as e:
             logger.error("Failed to update categories: %s", e)
 
-    def from_search(self, mode: str, categories: list, pages: Iterable[int]):
+    def from_search(self, params: dict, pages: Iterable[int]):
         """Update the database from the `search` API."""
-        self._process_scrape(self._scrape_search(mode, categories, pages))
+        self._process_scrape(self._scrape_search(params, pages))
 
     def from_detail(self, tids: Iterable[int]):
         """Update the database from the `detail` API."""
         self._process_scrape(self._scrape_detail(tids))
 
-    def _scrape_search(self, mode: str, categories: list, pages: Iterable[int]):
+    def _scrape_search(self, params: dict, pages: Iterable[int]):
         """Retrieve data from the `search` API."""
+        params.setdefault("pageSize", self._page_size)
         for p in pages:
+            params["pageNumber"] = p
             yield from self._request_api(
                 path="/api/torrent/search",
                 ratelimit=False,
                 headers={"Content-Type": "application/json"},
-                json={
-                    "mode": mode,
-                    "categories": categories or (),
-                    "pageNumber": p,
-                    "pageSize": self._page_size,
-                },
+                json=params,
             )["data"]["data"]
 
     def _scrape_detail(self, tids: Iterable[int]):
@@ -979,7 +976,7 @@ def parse_config(config_path: Path) -> dict:
         "request_interval": 10,
         "hourly_limit": 0,
         "nordvpn_path": "",
-        "mode_categories": [{"mode": "adult", "categories": []}],
+        "search_params": [{"mode": "adult", "categories": []}],
     }
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -1077,12 +1074,8 @@ def main():
             )
             mt.update_categories()
             if args.pages:
-                for m in conf["mode_categories"]:
-                    mt.from_search(
-                        mode=m["mode"],
-                        categories=m["categories"],
-                        pages=args.pages,
-                    )
+                for p in conf["search_params"]:
+                    mt.from_search(params=p, pages=args.pages)
             elif args.id:
                 mt.from_detail(tids=args.id)
 

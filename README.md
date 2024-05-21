@@ -25,21 +25,29 @@ pip install -r requirements.txt
 ## Usage
 
 1. Upon the first run, a default configuration file (`config.json`) will be generated alongside the script. Edit this config file before running this script again.
-2. Scrape some data into the database.
-3. Perform searches.
+2. Scrape some data into the database: `mtsearch.py update -p`
+3. Perform searches: `mtsearch.py search "your keyword"`
 
 ### Configuration File
 
 The script uses a configuration file (`config.json`) with the following fields:
 
-- `api_key`: API key for M-Team site.
-- `domain`: The URL of the M-Team site. Leave empty to use the default domain.
-- `request_interval`: Time interval between each request in seconds. Set to 0 to disable.
-- `hourly_limit`: Maximum number of requests in an hour. Set to 0 to disable.
-- `nordvpn_path`: Path to the NordVPN executable, used to bypass throttling. Ensure the NordVPN client is installed. Typical paths are:
+- `api_key`: Your API key.
+
+- `domain`: The URL of the M-Team site. Leave this empty to use the default domain.
+
+- `request_interval`: The time interval (in seconds) between each API request. Set to `0` to make requests without any delay.
+
+- `hourly_limit`: The maximum number of requests permitted per hour. Set to `0` for no limit.
+
+- `nordvpn_path`: The file path to the NordVPN executable, used to manage IP rotation and bypass throttling. Ensure the NordVPN client is installed. Common paths include:
   - **Windows**: `C:\Program Files\NordVPN\nordvpn.exe`
   - **Linux**: `nordvpn`
-- `mode_categories`: List of modes and their subcategories to scrape. `mode` can be: `normal`, `adult`, `movie`, `music`, `tvshow`, `waterfall`, `rss`, `rankings`. `categories` is a list of integers representing the sub-categories of `mode`. An empty list includes all subcategories.
+
+- `search_params`: A list of parameters for the `/api/torrent/search` API used during the execution of `mtsearch.py update -p`. These parameters determine the scope and type of data retrieved. For a complete list of available parameters, consult the official M-Team API documentation.
+  Common parameters include:
+  - `mode`: Determines the type of content to search. Available values are `normal`, `adult`, `movie`, `music`, `tvshow`, `waterfall`, `rss`, `rankings`.
+  - `categories`: An array of integers that identify specific categories within a selected mode. An empty array includes all categories.
 
 Example Configuration:
 
@@ -50,7 +58,7 @@ Example Configuration:
     "request_interval": 10,
     "hourly_limit": 0,
     "nordvpn_path": "nordvpn",
-    "mode_categories": [
+    "search_params": [
         {
             "mode": "adult",
             "categories": []
