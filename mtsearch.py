@@ -505,7 +505,7 @@ class CriticalAPIError(APIError):
 
 
 class MTeamScraper:
-    """A scraper for downloading torrent information from M-Team."""
+    """A scraper for M-Team."""
 
     _page_size: int = 200
     _throttle_timer: int = 120
@@ -563,7 +563,7 @@ class MTeamScraper:
         adapter = requests.adapters.HTTPAdapter(
             max_retries=urllib3.Retry(
                 total=7,
-                status_forcelist={429, 500, 502, 503, 504, 521, 524},
+                status_forcelist=frozenset((429, 500, 502, 503, 504, 521, 524)),
                 backoff_factor=0.5,
             )
         )
@@ -609,6 +609,7 @@ class MTeamScraper:
 
     def _scrape_search(self, params: dict, pages: Iterable[int]):
         """Retrieve data from the `search` API."""
+        params = dict(params)
         params.setdefault("pageSize", self._page_size)
         for p in pages:
             params["pageNumber"] = p
@@ -786,7 +787,7 @@ class MTeamScraper:
         try:
             file.write_bytes(content)
         except Exception as e:
-            logger.error(e)
+            logger.warning(e)
             try:
                 os.unlink(file)
             except Exception:
