@@ -37,7 +37,7 @@ from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from operator import attrgetter
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, List
 from urllib.parse import urljoin
 
 import requests
@@ -268,11 +268,11 @@ class Database:
 class Searcher:
 
     not_regex = frozenset(r"[]{}().*?+\|^$").isdisjoint
-    _categories: dict = None
 
     def __init__(self, db: Database, domain: str = None) -> None:
         self.db = db
         self.detail_url = urljoin(domain or _DOMAIN, "detail/")
+        self._categories = None
 
     @property
     def categories(self):
@@ -283,11 +283,11 @@ class Searcher:
     def search_print(self, pattern: str, mode: str):
         """Perform a search in the database and print the results."""
         sec = time.time()
-        results = self.search(pattern, mode)
+        result = self.search(pattern, mode)
         sec = time.time() - sec
 
-        # Sort by date
-        results = sorted(results, key=attrgetter("date"))
+        # Sort by id
+        result.sort(key=attrgetter("id"))
 
         # Print search results
         sep = "=" * 80 + "\n"
@@ -297,7 +297,7 @@ class Searcher:
         write = sys.stdout.write
         cat_get = self.categories.get
 
-        for t in results:
+        for t in result:
             write(sep)
             write(f1("ID", t.id))
             write(f1("Cat", cat_get(t.category, "Unknown")))
@@ -314,10 +314,10 @@ class Searcher:
                     write(f3("", p, humansize(l)))
 
         write(
-            f"{sep}Found {len(results):,} results in {self.db.get_total():,} torrents ({sec:.4f} seconds).\n"
+            f"{sep}Found {len(result):,} results in {self.db.get_total():,} torrents ({sec:.4f} seconds).\n"
         )
 
-    def search(self, pattern: str, mode: str) -> Iterable[Torrent]:
+    def search(self, pattern: str, mode: str) -> List[Torrent]:
         """
         Perform a search on the database based on the given pattern and search mode.
 
@@ -326,12 +326,12 @@ class Searcher:
             search_mode: The search mode, either 'fixed', 'fts', or 'regex'.
 
         Returns:
-            An iterable of Torrent objects.
+            A list of Torrent objects.
         """
 
         # Full-Text Search (FTS) based search
         if mode in ("fixed", "fts"):
-            return self._common_search(
+            result = self._common_search(
                 q1="""
                 SELECT rowid, *
                 FROM torrents_fts
@@ -345,38 +345,21 @@ class Searcher:
                 """,
                 param={"pat": f'"{pattern}"' if mode == "fixed" else pattern},
                 c=self.db.c,
-            ).values()
+            )
 
         # Regular expression search
-        if mode == "regex":
-            if self.not_regex(pattern):
-                m = re.search(r"[^\W_]+", pattern)
-                if not m:
-                    # Pattern is non-word, skip converting
-                    pass
-                elif m[0] == pattern:
-                    # Pattern is a simple word, use LIKE matching
-                    return self._common_search(
-                        q1="""
-                        SELECT *
-                        FROM torrents
-                        WHERE title LIKE :pat OR name LIKE :pat
-                        """,
-                        q2="""
-                        SELECT files.path, files.length, torrents.*
-                        FROM files
-                        JOIN torrents ON files.id = torrents.id
-                        WHERE files.path LIKE :pat
-                        """,
-                        param={"pat": f"%{pattern}%"},
-                        c=self.db.c,
-                    ).values()
-                else:
-                    # Convert pattern to a fuzzy regex
-                    pattern = re.sub(r"[\W_]+", r"[\\W_]*", pattern)
-            return self._regex_search(pattern).values()
+        elif mode == "regex":
+            # For patterns that do not contain any regex metacharacters, while
+            # containing word characters, convert to a fuzzy regex.
+            if self.not_regex(pattern) and re.search(r"[^\W_]", pattern):
+                pattern = re.sub(r"[\W_]+", r"[\\W_]*", pattern)
 
-        raise ValueError(f"Invalid search mode: {mode}")
+            result = self._regex_search(pattern)
+
+        else:
+            raise ValueError(f"Invalid search mode: {mode}")
+
+        return list(result.values())
 
     def _regex_search(self, pattern: str):
         """Perform a regular expression search using multi-processing."""
@@ -444,7 +427,7 @@ class Searcher:
             SELECT files.path, files.length, torrents.*
             FROM files
             JOIN torrents ON files.id = torrents.id
-            WHERE files.id BETWEEN ? AND ? AND RESEARCH(files.path)
+            WHERE torrents.id BETWEEN ? AND ? AND RESEARCH(files.path)
             """,
             param=(start_id, end_id),
             c=conn.cursor(),
@@ -560,8 +543,6 @@ class MTeamScraper:
 
     _PAGE_SIZE: int = 200
     _THROTTLE_TIMMER: int = 120
-    _nord_cmd: tuple = None
-    _dump_dir: Path = None
 
     def __init__(
         self,
@@ -584,6 +565,7 @@ class MTeamScraper:
         self.ratelimiter = ratelimiter
 
         # Setup NordVPN
+        self._nord_cmd = None
         if nordvpn_path:
             nordvpn_path = shutil.which(nordvpn_path)
             if nordvpn_path:
@@ -595,6 +577,7 @@ class MTeamScraper:
                 logger.warning("NordVPN not found. VPN switching will be disabled.")
 
         # Setup cache directory
+        self._dump_dir = None
         self._fetch_torrent = self._download_torrent
         if dump_dir:
             try:
