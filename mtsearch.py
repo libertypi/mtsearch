@@ -268,11 +268,17 @@ class Database:
 class Searcher:
 
     not_regex = frozenset(r"[]{}().*?+\|^$").isdisjoint
+    _categories: dict = None
 
     def __init__(self, db: Database, domain: str = None) -> None:
         self.db = db
-        self.cat_get = db.get_categories().get
         self.detail_url = urljoin(domain or _DOMAIN, "detail/")
+
+    @property
+    def categories(self):
+        if self._categories is None:
+            self._categories = self.db.get_categories()
+        return self._categories
 
     def search_print(self, pattern: str, mode: str):
         """Perform a search in the database and print the results."""
@@ -289,11 +295,12 @@ class Searcher:
         f2 = "{:>5}: {}  [{}]\n".format
         f3 = "{:>5}  {}  [{}]\n".format
         write = sys.stdout.write
+        cat_get = self.categories.get
 
         for t in results:
             write(sep)
             write(f1("ID", t.id))
-            write(f1("Cat", self.cat_get(t.category, "Unknown")))
+            write(f1("Cat", cat_get(t.category, "Unknown")))
             write(f1("Title", t.title))
             write(f1("Name", t.name))
             write(f1("Date", strftime(t.date)))
