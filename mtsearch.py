@@ -64,7 +64,7 @@ class Torrent:
 class Database:
     """Database class for managing SQL operations related to torrents."""
 
-    _sql_schema = """
+    _SCHEMA = """
     BEGIN;
 
     -- Create Main Tables
@@ -142,9 +142,9 @@ class Database:
 
     COMMIT;
     """
-    _sql_ins_torrents = "INSERT INTO torrents (id, category, title, name, date, length) VALUES (?, ?, ?, ?, ?, ?)"
-    _sql_ins_files = "INSERT INTO files (id, path, length) VALUES (?, ?, ?)"
-    _sql_upd_categories = """
+    _INS_TORRENTS = "INSERT INTO torrents (id, category, title, name, date, length) VALUES (?, ?, ?, ?, ?, ?)"
+    _INS_FILES = "INSERT INTO files (id, path, length) VALUES (?, ?, ?)"
+    _UPD_CATEGORIES = """
     INSERT INTO categories (id, parent, nameChs, nameCht, nameEng)
     VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
@@ -158,16 +158,15 @@ class Database:
         categories.nameCht != excluded.nameCht OR
         categories.nameEng != excluded.nameEng
     """
-    not_regex = frozenset(r"[]{}().*?+\|^$").isdisjoint
 
-    def __init__(self, db_path):
+    def __init__(self, path):
         """Initialize the database."""
-        self.db_path = Path(db_path)
-        self.conn = sqlite3.connect(db_path)
+        self.path = Path(path)
+        self.conn = sqlite3.connect(self.path)
         self.c = self.conn.cursor()
 
         # Create tables and triggers
-        self.c.executescript(self._sql_schema)
+        self.c.executescript(self._SCHEMA)
 
     def __enter__(self):
         """Enable use of 'with' statement."""
@@ -185,7 +184,7 @@ class Database:
     def update_categories(self, categories: tuple):
         """Update categories when there is a real change."""
         with self.conn:
-            self.c.executemany(self._sql_upd_categories, categories)
+            self.c.executemany(self._UPD_CATEGORIES, categories)
 
     def get_categories(self, column: str = "nameCht") -> dict:
         """Retrieve a dictionary of category IDs to the corresponding names."""
@@ -226,8 +225,8 @@ class Database:
     def insert_torrent(self, torrent: tuple, files: tuple):
         """Insert the metadata of a new torrent into the database."""
         with self.conn:
-            self.c.execute(self._sql_ins_torrents, torrent)
-            self.c.executemany(self._sql_ins_files, files)
+            self.c.execute(self._INS_TORRENTS, torrent)
+            self.c.executemany(self._INS_FILES, files)
 
     def delete_torrent(self, tid: int):
         """Delete the torrent from the database."""
@@ -237,7 +236,7 @@ class Database:
 
     def recreate(self):
         """Create a new database and insert the current data."""
-        dest_path = self.db_path.with_stem(self.db_path.stem + "_new")
+        dest_path = self.path.with_stem(self.path.stem + "_new")
         if dest_path.exists():
             raise Exception(f"Destination exists: {dest_path}")
 
@@ -245,18 +244,18 @@ class Database:
         new_conn = sqlite3.connect(dest_path)
         new_c = new_conn.cursor()
 
-        new_c.executescript(self._sql_schema)
+        new_c.executescript(self._SCHEMA)
         with new_conn:
             new_c.executemany(
-                self._sql_ins_torrents,
+                self._INS_TORRENTS,
                 self.c.execute("SELECT * from torrents ORDER BY id"),
             )
             new_c.executemany(
-                self._sql_ins_files,
+                self._INS_FILES,
                 self.c.execute("SELECT * from files ORDER BY id, rowid"),
             )
             new_c.executemany(
-                self._sql_upd_categories,
+                self._UPD_CATEGORIES,
                 self.c.execute("SELECT * from categories ORDER BY id"),
             )
 
@@ -265,7 +264,53 @@ class Database:
         logger.info("Database optimization completed.")
         new_conn.close()
 
-    def search(self, pattern: str, search_mode: str = "fixed") -> Iterable[Torrent]:
+
+class Searcher:
+
+    not_regex = frozenset(r"[]{}().*?+\|^$").isdisjoint
+
+    def __init__(self, db: Database, domain: str = None) -> None:
+        self.db = db
+        self.cat_get = db.get_categories().get
+        self.detail_url = urljoin(domain or _DOMAIN, "detail/")
+
+    def search_print(self, pattern: str, mode: str):
+        """Perform a search in the database and print the results."""
+        sec = time.time()
+        results = self.search(pattern, mode)
+        sec = time.time() - sec
+
+        # Sort by date
+        results = sorted(results, key=attrgetter("date"))
+
+        # Print search results
+        sep = "=" * 80 + "\n"
+        f1 = "{:>5}: {}\n".format
+        f2 = "{:>5}: {}  [{}]\n".format
+        f3 = "{:>5}  {}  [{}]\n".format
+        write = sys.stdout.write
+
+        for t in results:
+            write(sep)
+            write(f1("ID", t.id))
+            write(f1("Cat", self.cat_get(t.category, "Unknown")))
+            write(f1("Title", t.title))
+            write(f1("Name", t.name))
+            write(f1("Date", strftime(t.date)))
+            write(f1("Size", humansize(t.length)))
+            write(f1("URL", f"{self.detail_url}{t.id}"))
+            if t.files:
+                files = iter(t.files)
+                p, l = next(files)
+                write(f2("Files", p, humansize(l)))
+                for p, l in files:
+                    write(f3("", p, humansize(l)))
+
+        write(
+            f"{sep}Found {len(results):,} results in {self.db.get_total():,} torrents ({sec:.4f} seconds).\n"
+        )
+
+    def search(self, pattern: str, mode: str) -> Iterable[Torrent]:
         """
         Perform a search on the database based on the given pattern and search mode.
 
@@ -278,7 +323,7 @@ class Database:
         """
 
         # Full-Text Search (FTS) based search
-        if search_mode in ("fixed", "fts"):
+        if mode in ("fixed", "fts"):
             return self._common_search(
                 q1="""
                 SELECT rowid, *
@@ -291,12 +336,12 @@ class Database:
                 JOIN torrents ON files_fts.id = torrents.id
                 WHERE files_fts.path MATCH :pat
                 """,
-                param={"pat": f'"{pattern}"' if search_mode == "fixed" else pattern},
-                c=self.c,
+                param={"pat": f'"{pattern}"' if mode == "fixed" else pattern},
+                c=self.db.c,
             ).values()
 
         # Regular expression search
-        if search_mode == "regex":
+        if mode == "regex":
             if self.not_regex(pattern):
                 m = re.search(r"[^\W_]+", pattern)
                 if not m:
@@ -317,14 +362,14 @@ class Database:
                         WHERE files.path LIKE :pat
                         """,
                         param={"pat": f"%{pattern}%"},
-                        c=self.c,
+                        c=self.db.c,
                     ).values()
                 else:
                     # Convert pattern to a fuzzy regex
                     pattern = re.sub(r"[\W_]+", r"[\\W_]*", pattern)
             return self._regex_search(pattern).values()
 
-        raise ValueError(f"Invalid search mode: {search_mode}")
+        raise ValueError(f"Invalid search mode: {mode}")
 
     def _regex_search(self, pattern: str):
         """Perform a regular expression search using multi-processing."""
@@ -332,25 +377,26 @@ class Database:
         result = {}
         futures = []
         query = "SELECT id FROM torrents ORDER BY id LIMIT 1 OFFSET ?"
+        db = self.db
         args = (
             self._re_worker,
-            self.db_path.as_uri() + "?mode=ro",  # read-only
+            db.path.as_uri() + "?mode=ro",  # read-only
             re.compile(pattern, re.IGNORECASE).search,
         )
 
         with ProcessPoolExecutor() as ex:
             # Note: Using `ex._max_workers` to get the number of workers.
-            per_worker, remainder = divmod(self.get_total(), ex._max_workers)
+            per_worker, remainder = divmod(db.get_total(), ex._max_workers)
 
             # Query boundary IDs and distribute tasks among workers
             row = 0
-            start_id = self.c.execute(query, (0,)).fetchone()[0]
+            start_id = db.c.execute(query, (0,)).fetchone()[0]
             for _ in range(ex._max_workers):
                 row += per_worker
                 if remainder > 0:
                     row += 1
                     remainder -= 1
-                end_id = self.c.execute(query, (row - 1,)).fetchone()[0]
+                end_id = db.c.execute(query, (row - 1,)).fetchone()[0]
                 futures.append(ex.submit(*args, start_id, end_id))
                 start_id = end_id
 
@@ -381,7 +427,7 @@ class Database:
         )
 
         # Perform the regex search using the common search method and close the connection.
-        result = Database._common_search(
+        result = Searcher._common_search(
             q1="""
             SELECT * FROM torrents
             WHERE id BETWEEN ? AND ?
@@ -501,25 +547,23 @@ class APIError(Exception):
 class CriticalAPIError(APIError):
     """Exception for critical API errors."""
 
-    pass
-
 
 class MTeamScraper:
     """A scraper for M-Team."""
 
-    _page_size: int = 200
-    _throttle_timer: int = 120
+    _PAGE_SIZE: int = 200
+    _THROTTLE_TIMMER: int = 120
     _nord_cmd: tuple = None
-    _cache_dir: Path = None
+    _dump_dir: Path = None
 
     def __init__(
         self,
         api_key: str,
-        domain: str,
-        database: Database,
+        db: Database,
         ratelimiter: RateLimiter,
+        domain: str = None,
         nordvpn_path: str = None,
-        cache_dir: str = None,
+        dump_dir: str = None,
     ):
         """Initialize the MTeamScraper instance."""
         if not api_key:
@@ -529,7 +573,7 @@ class MTeamScraper:
         self._domain = domain or _DOMAIN
         self._url_cache = {}
 
-        self.database = database
+        self.db = db
         self.ratelimiter = ratelimiter
 
         # Setup NordVPN
@@ -545,15 +589,15 @@ class MTeamScraper:
 
         # Setup cache directory
         self._fetch_torrent = self._download_torrent
-        if cache_dir:
+        if dump_dir:
             try:
-                cache_dir = Path(cache_dir)
-                cache_dir.mkdir(parents=True, exist_ok=True)
+                dump_dir = Path(dump_dir)
+                dump_dir.mkdir(parents=True, exist_ok=True)
             except Exception as e:
                 logger.error("Unable to access cache directory: %s", e)
             else:
-                self._cache_dir = cache_dir
-                self._fetch_torrent = self._cache_torrent
+                self._dump_dir = dump_dir
+                self._fetch_torrent = self._dump_torrent
 
         self._init_session()
 
@@ -593,7 +637,7 @@ class MTeamScraper:
                 )
                 for d in categories
             )
-            self.database.update_categories(categories)
+            self.db.update_categories(categories)
         except CriticalAPIError:
             raise
         except Exception as e:
@@ -610,7 +654,7 @@ class MTeamScraper:
     def _scrape_search(self, params: dict, pages: Iterable[int]):
         """Retrieve data from the `search` API."""
         params = dict(params)
-        params.setdefault("pageSize", self._page_size)
+        params.setdefault("pageSize", self._PAGE_SIZE)
         for p in pages:
             params["pageNumber"] = p
             yield from self._request_api(
@@ -631,9 +675,9 @@ class MTeamScraper:
             except CriticalAPIError:
                 raise
             except APIError as e:
-                if "種子未找到" in e.message and self.database.torrent_exists(tid):
+                if "種子未找到" in e.message and self.db.torrent_exists(tid):
                     logger.info("Remove torrent: %s. (%s)", tid, e.message)
-                    self.database.delete_torrent(tid)
+                    self.db.delete_torrent(tid)
                 else:
                     logger.error("ID: %s. %s", tid, e)
             except Exception as e:
@@ -641,7 +685,7 @@ class MTeamScraper:
 
     def _process_scrape(self, items: Iterable[dict]):
         """Process and update the database with the provided scrape results."""
-        torrent_up2date = self.database.torrent_up2date
+        torrent_up2date = self.db.torrent_up2date
         join = b"/".join
 
         for item in items:
@@ -693,7 +737,7 @@ class MTeamScraper:
                             "ID: %s. Invalid torrent length: '%s'.", tid, length
                         )
                 # insert into the database
-                self.database.insert_torrent(
+                self.db.insert_torrent(
                     torrent=(tid, category, title, name, date, length),
                     files=files,
                 )
@@ -744,9 +788,9 @@ class MTeamScraper:
                 self._init_session()
             else:
                 logger.info(
-                    "Throttled. Waiting for %ss. (%s)", self._throttle_timer, message
+                    "Throttled. Waiting for %ss. (%s)", self._THROTTLE_TIMMER, message
                 )
-                time.sleep(self._throttle_timer)
+                time.sleep(self._THROTTLE_TIMMER)
         elif "key無效" in message:
             raise CriticalAPIError(f"Invalid API key. ({message})")
         else:
@@ -774,9 +818,9 @@ class MTeamScraper:
             else:
                 return res.content
 
-    def _cache_torrent(self, tid: int):
-        """Download and cache the torrent file."""
-        file = self._cache_dir.joinpath(f"{tid}.torrent")
+    def _dump_torrent(self, tid: int):
+        """Download and dump the torrent file."""
+        file = self._dump_dir.joinpath(f"{tid}.torrent")
         if file.exists():
             logger.info("Using cache: %s", file.name)
             try:
@@ -932,8 +976,8 @@ examples:
     )
     subparser.set_defaults(mode="update")
     subparser.add_argument(
-        "-c",
-        dest="cache_dir",
+        "-d",
+        dest="dump_dir",
         help="save torrent files to this directory",
     )
     subparser.add_argument(
@@ -950,7 +994,7 @@ examples:
         type=parse_range,
         const="1-3",
         nargs="?",
-        help="scrape one or more pages in 'page' or 'start-end' format (default: %(const)s)",
+        help="scrape one or more pages (format: 'page' or 'start-end', default: %(const)s)",
     )
     exgroup.add_argument(
         "-i",
@@ -994,45 +1038,6 @@ def parse_config(config_path: Path) -> dict:
         sys.exit(f"The configuration file at '{config_path}' is malformed.")
 
 
-def _search(pattern: str, db: Database, search_mode: str, domain: str):
-    """Perform a search in the local database and print the results."""
-    sec = time.time()
-    results = db.search(pattern, search_mode)
-    sec = time.time() - sec
-
-    # Sort by date
-    results = sorted(results, key=attrgetter("date"))
-
-    # Print search results
-    sep = "=" * 80 + "\n"
-    f1 = "{:>5}: {}\n".format
-    f2 = "{:>5}: {}  [{}]\n".format
-    f3 = "{:>5}  {}  [{}]\n".format
-    write = sys.stdout.write
-    cat_get = db.get_categories().get
-    detail_url = urljoin(domain or _DOMAIN, "detail/")
-
-    for t in results:
-        write(sep)
-        write(f1("ID", t.id))
-        write(f1("Cat", cat_get(t.category, "Unknown")))
-        write(f1("Title", t.title))
-        write(f1("Name", t.name))
-        write(f1("Date", strftime(t.date)))
-        write(f1("Size", humansize(t.length)))
-        write(f1("URL", f"{detail_url}{t.id}"))
-        if t.files:
-            files = iter(t.files)
-            p, l = next(files)
-            write(f2("Files", p, humansize(l)))
-            for p, l in files:
-                write(f3("", p, humansize(l)))
-
-    write(
-        f"{sep}Found {len(results):,} results in {db.get_total():,} torrents ({sec:.4f} seconds).\n"
-    )
-
-
 def main():
 
     args = parse_args()
@@ -1044,16 +1049,16 @@ def main():
         if args.mode == "search":
             config_logger()
 
-            param = (db, args.search_mode, conf["domain"])
+            searcher = Searcher(db, conf["domain"])
+
             if args.pattern:
-                _search(args.pattern, *param)
+                searcher.search_print(args.pattern, args.search_mode)
             else:
                 while True:
-                    # Strip white-space only in interactive mode
-                    pattern = input("Search pattern: ").strip()
+                    pattern = input("Pattern: ").strip()
                     if not pattern:
                         break
-                    _search(pattern, *param)
+                    searcher.search_print(pattern, args.search_mode)
 
         elif args.mode == "update":
             config_logger(logfile=join_root("logfile.log"))
@@ -1061,19 +1066,22 @@ def main():
             if args.recreate:
                 db.recreate()
                 return
+
             if args.no_limit:
                 limiter = RateLimiter()
             else:
                 limiter = RateLimiter(conf["request_interval"], conf["hourly_limit"])
+
             mt = MTeamScraper(
                 api_key=conf["api_key"],
-                domain=conf["domain"],
-                database=db,
+                db=db,
                 ratelimiter=limiter,
+                domain=conf["domain"],
                 nordvpn_path=conf["nordvpn_path"],
-                cache_dir=args.cache_dir,
+                dump_dir=args.dump_dir,
             )
             mt.update_categories()
+
             if args.pages:
                 for p in conf["search_params"]:
                     mt.from_search(params=p, pages=args.pages)
