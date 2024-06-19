@@ -44,7 +44,7 @@ import requests
 import urllib3
 from bencoder import bdecode  # bencoder.pyx
 
-_DOMAIN = "https://kp.m-team.cc"
+_DOMAIN = "https://api.m-team.cc"
 logger = logging.getLogger(__name__)
 
 
@@ -161,7 +161,7 @@ class Database:
 
     def __init__(self, path):
         """Initialize the database."""
-        self.path = Path(path)
+        self.path = path if isinstance(path, Path) else Path(path)
         self.conn = sqlite3.connect(self.path)
         self.c = self.conn.cursor()
 
@@ -596,7 +596,7 @@ class MTeamScraper:
         self.session = s = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
             max_retries=urllib3.Retry(
-                total=7,
+                total=5,
                 status_forcelist=frozenset((429, 500, 502, 503, 504, 521, 524)),
                 backoff_factor=0.5,
             )
@@ -1009,7 +1009,7 @@ def parse_config(config_path: Path) -> dict:
         "api_key": "",
         "domain": _DOMAIN,
         "request_interval": 10,
-        "hourly_limit": 0,
+        "hourly_limit": 100,
         "nordvpn_path": "",
         "search_params": [{"mode": "adult", "categories": []}],
     }
@@ -1080,6 +1080,7 @@ def main():
 
     except Exception as e:
         logger.critical(e)
+
     finally:
         db.close()
 
