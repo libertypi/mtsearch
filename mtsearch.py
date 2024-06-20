@@ -269,9 +269,8 @@ class Searcher:
 
     not_regex = frozenset(r"[]{}().*?+\|^$").isdisjoint
 
-    def __init__(self, db: Database, domain: str = None) -> None:
+    def __init__(self, db: Database) -> None:
         self.db = db
-        self.detail_url = urljoin(domain or _DOMAIN, "detail/")
         self._categories = None
 
     @property
@@ -305,7 +304,7 @@ class Searcher:
             write(f1("Name", t.name))
             write(f1("Date", strftime(t.date)))
             write(f1("Size", humansize(t.length)))
-            write(f1("URL", f"{self.detail_url}{t.id}"))
+            write(f1("URL", f"https://kp.m-team.cc/detail/{t.id}"))
             if t.files:
                 files = iter(t.files)
                 p, l = next(files)
@@ -1009,7 +1008,7 @@ def parse_config(config_path: Path) -> dict:
         "api_key": "",
         "domain": _DOMAIN,
         "request_interval": 10,
-        "hourly_limit": 100,
+        "hourly_limit": 150,
         "nordvpn_path": "",
         "search_params": [{"mode": "adult", "categories": []}],
     }
@@ -1039,7 +1038,7 @@ def main():
         if args.mode == "search":
             config_logger()
 
-            searcher = Searcher(db, conf["domain"])
+            searcher = Searcher(db)
 
             if args.pattern:
                 searcher.search_print(args.pattern, args.search_mode)
