@@ -48,7 +48,7 @@ _DOMAIN = "https://api.m-team.cc"
 logger = logging.getLogger(__name__)
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class Torrent:
     """Data class to hold the details of a torrent."""
 
@@ -281,9 +281,9 @@ class Searcher:
 
     def search_print(self, pattern: str, mode: str):
         """Perform a search in the database and print the results."""
-        sec = time.time()
+        sec = time.perf_counter()
         result = self.search(pattern, mode)
-        sec = time.time() - sec
+        sec = time.perf_counter() - sec
 
         # Sort by id
         result.sort(key=attrgetter("id"))
@@ -472,29 +472,37 @@ class RateLimiter:
        global rate limiting.
     """
 
+    __slots__ = (
+        "waits",
+        "request_que",
+        "last_request",
+        "hourly_limit",
+        "request_interval",
+    )
+
     def __init__(self, request_interval: int = None, hourly_limit: int = None):
-        self._waitlist = []
+        self.waits = []
         self.request_que = deque()
         self.last_request = 0
 
         if hourly_limit and hourly_limit > 0:
             self.hourly_limit = hourly_limit
-            self._waitlist.append(self.wait_global)
+            self.waits.append(self.wait_hourly)
         else:
             self.hourly_limit = None
 
         if request_interval and request_interval > 0:
             self.request_interval = request_interval
-            self._waitlist.append(self.wait_request)
+            self.waits.append(self.wait_request)
         else:
             self.request_interval = None
 
-    def wait_global(self):
-        """Global rate limiting logic."""
+    def wait_hourly(self):
+        """Hourly rate limiting logic."""
         que = self.request_que
-        oldest_allowed = time.time() - 3600
+        oldest_allowed = time.perf_counter() - 3600
         while que and que[0] <= oldest_allowed:
-            self.request_que.popleft()
+            que.popleft()
 
         if len(que) >= self.hourly_limit:
             sleep = que[0] - oldest_allowed
@@ -505,7 +513,7 @@ class RateLimiter:
 
     def wait_request(self):
         """Per-request rate limiting logic."""
-        sleep = self.request_interval - time.time() + self.last_request
+        sleep = self.request_interval - time.perf_counter() + self.last_request
         if sleep > 0:
             logger.info(
                 f"Waiting for {sleep:.2f}s. Request interval: {self.request_interval:.2f}s."
@@ -514,13 +522,13 @@ class RateLimiter:
 
     def __enter__(self):
         """Invoke all active rate limiting checks."""
-        for func in self._waitlist:
+        for func in self.waits:
             func()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         """Record the time of the most recent request."""
-        self.last_request = time.time()
+        self.last_request = time.perf_counter()
         if self.hourly_limit:
             self.request_que.append(self.last_request)
 
