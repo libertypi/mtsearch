@@ -213,7 +213,7 @@ class Database:
             return False
         if t[0] != category or t[1] != title:
             logger.info(
-                "Updating %s. Category: '%s' -> '%s'. Title: '%s' -> %s.", tid,
+                "Updating %s. Category: '%s' -> '%s'. Title: '%s' -> '%s'.", tid,
                 t[0], category, t[1], title)  # fmt: skip
             with self.conn:
                 self.c.execute(
@@ -222,7 +222,7 @@ class Database:
                 )
         return True
 
-    def insert_torrent(self, torrent: tuple, files: tuple):
+    def insert_torrent(self, torrent: tuple, files: list):
         """Insert the metadata of a new torrent into the database."""
         with self.conn:
             self.c.execute(self._INS_TORRENTS, torrent)
@@ -368,7 +368,7 @@ class Searcher:
         query = "SELECT id FROM torrents ORDER BY id LIMIT 1 OFFSET ?"
         db = self.db
         args = (
-            self._re_worker,
+            Searcher._re_worker,
             db.path.as_uri() + "?mode=ro",  # read-only
             re.compile(pattern, re.IGNORECASE).search,
         )
@@ -561,10 +561,7 @@ class MTeamScraper:
         dump_dir: str = None,
     ):
         """Initialize the MTeamScraper instance."""
-        if not api_key:
-            raise ValueError("api_key is null.")
-        self.api_key = api_key
-
+        self._init_session(api_key)
         self._domain = domain or _DOMAIN
         self._url_cache = {}
 
@@ -596,15 +593,15 @@ class MTeamScraper:
                 self._dump_dir = dump_dir
                 self._fetch_torrent = self._dump_torrent
 
-        self._init_session()
-
-    def _init_session(self):
+    def _init_session(self, api_key: str):
         """Initialize a requests session with retries and headers."""
+        if not api_key:
+            raise ValueError("api_key is null.")
         self.session = s = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
             max_retries=urllib3.Retry(
                 total=5,
-                status_forcelist=frozenset((429, 500, 502, 503, 504, 521, 524)),
+                status_forcelist={429, 500, 502, 503, 504, 521, 524},
                 backoff_factor=0.5,
             )
         )
@@ -612,8 +609,9 @@ class MTeamScraper:
         s.mount("https://", adapter)
         s.headers.update(
             {
-                "x-api-key": self.api_key,
+                "x-api-key": api_key,
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.",
+                "Content-Type": "application/x-www-form-urlencoded",
             }
         )
 
@@ -717,10 +715,10 @@ class MTeamScraper:
                 files = data.get(b"files")
                 if files:
                     k = b"path.utf-8" if b"path.utf-8" in files[0] else b"path"
-                    files = tuple(
+                    files = [
                         (tid, join(f[k]).decode(errors="ignore"), get_int(f, b"length"))
                         for f in files
-                    )
+                    ]
                     if not all(f[1] and f[2] >= 0 for f in files):
                         logger.error("ID: %s. Invalid file path.", tid)
                     length = sum(f[2] for f in files)
@@ -743,13 +741,7 @@ class MTeamScraper:
             except Exception as e:
                 logger.error("ID: %s. %s", item.get("id"), e)
 
-    def _request_api(
-        self,
-        path: str,
-        ratelimit: bool = True,
-        headers: dict = {"Content-Type": "application/x-www-form-urlencoded"},
-        **kwargs,
-    ):
+    def _request_api(self, path: str, ratelimit: bool = True, **kwargs):
         """Make a POST request to the API and return JSON response."""
         try:
             url = self._url_cache[path]
@@ -762,9 +754,9 @@ class MTeamScraper:
         while True:
             if ratelimit:
                 with self.ratelimiter:
-                    res = self.session.post(url, headers=headers, **kwargs)
+                    res = self.session.post(url, **kwargs)
             else:
-                res = self.session.post(url, headers=headers, **kwargs)
+                res = self.session.post(url, **kwargs)
             res.raise_for_status()
             res = res.json()
 
@@ -891,14 +883,6 @@ def config_logger(logger: logging.Logger = logger, logfile: Path = None):
 
 
 def parse_args():
-    def parse_range(string: str):
-        m = re.fullmatch(r"(\d+)(?:-(\d+))?", string)
-        if m:
-            return range(int(m[1]), int(m[2] or m[1]) + 1)
-        raise argparse.ArgumentTypeError(
-            "Invalid range format. Use 'page' or 'start-end'."
-        )
-
     parser = argparse.ArgumentParser(
         description="""\
 A M-Team scraper and search utility.
@@ -988,10 +972,10 @@ examples:
     exgroup.add_argument(
         "-p",
         dest="pages",
-        type=parse_range,
+        type=_parse_range,
         const="1-3",
         nargs="?",
-        help="scrape one or more pages (format: 'page' or 'start-end', default: %(const)s)",
+        help="scrape one or more pages (format: 'stop' or 'start-stop', default: %(const)s)",
     )
     exgroup.add_argument(
         "-i",
@@ -1008,6 +992,15 @@ examples:
     )
 
     return parser.parse_args()
+
+
+def _parse_range(string: str):
+    m = re.fullmatch(r"(?:(\d+)-)?(\d+)", string)
+    if m is not None:
+        return range(int(m[1] or 1), int(m[2]) + 1)
+    raise argparse.ArgumentTypeError(
+        "Invalid range format. Use 'stop' or 'start-stop'."
+    )
 
 
 def parse_config(config_path: Path) -> dict:

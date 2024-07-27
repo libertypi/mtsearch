@@ -107,22 +107,22 @@ options:
 #### For updating
 
 ```
-usage: mtsearch.py update [-h] [-c CACHE_DIR] [--no-limit] (-p [PAGES] | -i ID [ID ...] | --recreate)
+usage: mtsearch.py update [-h] [-d DUMP_DIR] [--no-limit] (-p [PAGES] | -i ID [ID ...] | --recreate)
 
 options:
   -h, --help      show this help message and exit
-  -c CACHE_DIR    save torrent files to this directory
+  -d DUMP_DIR     save torrent files to this directory
   --no-limit      temporarily disable rate limiting
 
 actions:
-  -p [PAGES]      scrape one or more pages in 'page' or 'start-end' format (default: 1-3)
+  -p [PAGES]      scrape one or more pages (format: 'stop' or 'start-stop', default: 1-3)
   -i ID [ID ...]  update one or more torrent IDs
   --recreate      recreate the database
 ```
 
 - Scrape the 5 most recent pages, bypassing the rate limiter.
 
-  `mtsearch.py update -p 1-5 --no-limit`
+  `mtsearch.py update -p 5 --no-limit`
 
 - Scrape torrent ID 3, 5, and 7.
 
