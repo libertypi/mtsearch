@@ -42,7 +42,7 @@ from urllib.parse import urljoin
 
 import requests
 import urllib3
-from bencoder import bdecode  # bencoder.pyx
+from fastbencode import bdecode  # pip install fastbencode
 
 _DOMAIN = "https://api.m-team.cc"
 logger = logging.getLogger(__name__)
