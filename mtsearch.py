@@ -852,12 +852,14 @@ def strftime(epoch: int, fmt: str = "%F") -> str:
 
 
 def humansize(size: int) -> str:
-    """Convert bytes to human readable sizes."""
-    for suffix in ("", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"):
-        if size < 1024:
-            return f"{size:.2f} {suffix}B"
-        size /= 1024
-    return f"{size:.2f} YiB"
+    """Convert a byte count to a human-readable IEC size up to YiB."""
+    if size == 0:
+        return "0.00 B"
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB")
+    idx = (abs(size).bit_length() - 1) // 10
+    if idx >= len(units):
+        idx = len(units) - 1
+    return f"{size / (1 << (idx * 10)):.2f} {units[idx]}"
 
 
 def config_logger(logger: logging.Logger = logger, logfile: Path = None):
