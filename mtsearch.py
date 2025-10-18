@@ -159,9 +159,9 @@ class Database:
         categories.nameEng != excluded.nameEng
     """
 
-    def __init__(self, path):
+    def __init__(self, db_path: Path | str):
         """Initialize the database."""
-        self.path = path if isinstance(path, Path) else Path(path)
+        self.path = db_path if isinstance(db_path, Path) else Path(db_path)
         self.conn = sqlite3.connect(self.path)
         self.c = self.conn.cursor()
 
@@ -201,10 +201,10 @@ class Database:
             is not None
         )
 
-    def torrent_up2date(self, tid: int, category: int, title: str) -> bool:
+    def check_and_update(self, tid: int, category: int, title: str) -> bool:
         """
-        True if the torrent exists, False otherwise. Updates the torrent if the
-        category or title has changed.
+        Check if the torrent exists and update its category and title if they
+        have changed.
         """
         t = self.c.execute(
             "SELECT category, title FROM torrents WHERE id = ?", (tid,)
@@ -480,43 +480,50 @@ class RateLimiter:
         "request_interval",
     )
 
-    def __init__(self, request_interval: int = None, hourly_limit: int = None):
+    def __init__(
+        self,
+        request_interval: int | float | None = None,
+        hourly_limit: int | None = None,
+    ):
         self.waits = []
         self.request_que = deque()
         self.last_request = 0
 
         if hourly_limit and hourly_limit > 0:
             self.hourly_limit = hourly_limit
-            self.waits.append(self.wait_hourly)
+            self.waits.append(self._wait_hourly)
         else:
             self.hourly_limit = None
 
         if request_interval and request_interval > 0:
             self.request_interval = request_interval
-            self.waits.append(self.wait_request)
+            self.waits.append(self._wait_request)
         else:
             self.request_interval = None
 
-    def wait_hourly(self):
+    def _wait_hourly(self):
         """Hourly rate limiting logic."""
         que = self.request_que
-        oldest_allowed = time.perf_counter() - 3600
+        oldest_allowed = time.monotonic() - 3600
         while que and que[0] <= oldest_allowed:
             que.popleft()
 
         if len(que) >= self.hourly_limit:
             sleep = que[0] - oldest_allowed
             logger.info(
-                f"Waiting for {sleep:.2f}s. Hourly limit: {self.hourly_limit}s."
+                "Waiting for %.2fs. Hourly limit: %ds.", sleep, self.hourly_limit
             )
+
             time.sleep(sleep)
 
-    def wait_request(self):
+    def _wait_request(self):
         """Per-request rate limiting logic."""
-        sleep = self.request_interval - time.perf_counter() + self.last_request
+        sleep = self.request_interval - time.monotonic() + self.last_request
         if sleep > 0:
             logger.info(
-                f"Waiting for {sleep:.2f}s. Request interval: {self.request_interval:.2f}s."
+                "Waiting for %.2fs. Request interval: %.2fs.",
+                sleep,
+                self.request_interval,
             )
             time.sleep(sleep)
 
@@ -528,7 +535,7 @@ class RateLimiter:
 
     def __exit__(self, exc_type, exc_value, traceback):
         """Record the time of the most recent request."""
-        self.last_request = time.perf_counter()
+        self.last_request = time.monotonic()
         if self.hourly_limit:
             self.request_que.append(self.last_request)
 
@@ -561,12 +568,10 @@ class MTeamScraper:
         dump_dir: str = None,
     ):
         """Initialize the MTeamScraper instance."""
-        self._init_session(api_key)
-        self._domain = domain or _DOMAIN
-        self._url_cache = {}
-
+        self._api_key = api_key
         self.db = db
         self.ratelimiter = ratelimiter
+        self._domain = domain or _DOMAIN
 
         # Setup NordVPN
         self._nord_cmd = None
@@ -593,10 +598,15 @@ class MTeamScraper:
                 self._dump_dir = dump_dir
                 self._fetch_torrent = self._dump_torrent
 
-    def _init_session(self, api_key: str):
+        # Initialize the requests session
+        self._init_session()
+        self._url_cache = {}
+
+    def _init_session(self):
         """Initialize a requests session with retries and headers."""
-        if not api_key:
-            raise ValueError("api_key is null.")
+        if not self._api_key:
+            raise ValueError("API key is required.")
+
         self.session = s = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
             max_retries=urllib3.Retry(
@@ -609,7 +619,7 @@ class MTeamScraper:
         s.mount("https://", adapter)
         s.headers.update(
             {
-                "x-api-key": api_key,
+                "x-api-key": self._api_key,
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.",
                 "Content-Type": "application/x-www-form-urlencoded",
             }
@@ -680,7 +690,7 @@ class MTeamScraper:
 
     def _process_scrape(self, items: Iterable[dict]):
         """Process and update the database with the provided scrape results."""
-        torrent_up2date = self.db.torrent_up2date
+        check_and_update = self.db.check_and_update
         join = b"/".join
 
         for item in items:
@@ -695,7 +705,7 @@ class MTeamScraper:
                 if category <= 0:
                     logger.error("ID: %s. Invalid category: '%s'.", tid, category)
                 # check and update existing torrent
-                if torrent_up2date(tid, category, title):
+                if check_and_update(tid, category, title):
                     continue
                 # download and decode the torrent
                 data = bdecode(self._fetch_torrent(tid))
@@ -851,8 +861,9 @@ def strftime(epoch: int, fmt: str = "%F") -> str:
     return time.strftime(fmt, time.gmtime(epoch))
 
 
-def humansize(size: int) -> str:
+def humansize(size) -> str:
     """Convert a byte count to a human-readable IEC size up to YiB."""
+    size = int(size)
     if size == 0:
         return "0.00 B"
     units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB")
@@ -862,9 +873,11 @@ def humansize(size: int) -> str:
     return f"{size / (1 << (idx * 10)):.2f} {units[idx]}"
 
 
-def config_logger(logger: logging.Logger = logger, logfile: Path = None):
+def init_logger(logfile: Path = None):
     """Configure logger to log to console and optionally to a file."""
     logger.handlers.clear()
+    logger.propagate = False
+
     logger.setLevel(logging.INFO)
 
     # Console handler
@@ -885,6 +898,7 @@ def config_logger(logger: logging.Logger = logger, logfile: Path = None):
 
 
 def parse_args():
+
     parser = argparse.ArgumentParser(
         description="""\
 A M-Team scraper and search utility.
@@ -898,6 +912,13 @@ Contributor: ChatGPT - OpenAI""",
     )
     subparsers = parser.add_subparsers(title="mode", required=True)
 
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--profile",
+        type=Path,
+        help="profile directory (default: <script_dir>/profile)",
+    )
+
     # search
     subparser = subparsers.add_parser(
         "search",
@@ -910,6 +931,7 @@ examples:
   %(prog)s -e "202[2-4]"
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=(common,),
     )
     subparser.set_defaults(mode="search")
     subparser.add_argument(
@@ -956,6 +978,7 @@ examples:
   %(prog)s -i 3 5 7
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=(common,),
     )
     subparser.set_defaults(mode="update")
     subparser.add_argument(
@@ -1033,13 +1056,19 @@ def parse_config(config_path: Path) -> dict:
 def main():
 
     args = parse_args()
-    join_root = Path(__file__).parent.joinpath
-    conf = parse_config(join_root("config.json"))
 
-    db = Database(join_root("data.db"))
+    if args.profile:
+        profile = args.profile
+    else:
+        profile = Path(__file__).parent.joinpath("profile")
+    profile.mkdir(parents=True, exist_ok=True)
+
+    conf = parse_config(profile.joinpath("config.json"))
+    db = Database(profile.joinpath("data.db"))
+
     try:
         if args.mode == "search":
-            config_logger()
+            init_logger()  # log to console only
 
             searcher = Searcher(db)
 
@@ -1053,7 +1082,7 @@ def main():
                     searcher.search_print(pattern, args.search_mode)
 
         elif args.mode == "update":
-            config_logger(logfile=join_root("logfile.log"))
+            init_logger(profile.joinpath("logfile.log"))
 
             if args.recreate:
                 db.recreate()

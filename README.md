@@ -13,7 +13,7 @@ MTSearch is a powerful utility for scraping torrent data from M-Team torrent sit
 
 ## Installation
 
-To get started, you'll need Python 3. Then clone the GitHub repository and install the required packages:
+To get started, you'll need Python 3.10+. Then clone the GitHub repository and install the required packages:
 
 ```bash
 git clone https://github.com/libertypi/mtsearch.git
@@ -24,7 +24,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-1. Upon the first run, a default configuration file (`config.json`) will be generated alongside the script. Edit this config file before running this script again.
+1. Upon the first run, a default configuration file (`config.json`) will be generated in the profile directory (default: `<script_dir>/profile`). Edit this config file before running this script again.
 2. Scrape some data into the database: `mtsearch.py update -p`
 3. Perform searches: `mtsearch.py search "your keyword"`
 
@@ -33,17 +33,12 @@ pip install -r requirements.txt
 The script uses a configuration file (`config.json`) with the following fields:
 
 - `api_key`: Your API key.
-
 - `domain`: The URL of the M-Team site. Leave this empty to use the default domain.
-
 - `request_interval`: The time interval (in seconds) between each API request. Set to `0` to make requests without any delay.
-
 - `hourly_limit`: The maximum number of requests permitted per hour. Set to `0` for no limit.
-
 - `nordvpn_path`: The file path to the NordVPN executable, used to manage IP rotation and bypass throttling. Ensure the NordVPN client is installed. Common paths include:
   - **Windows**: `C:\Program Files\NordVPN\nordvpn.exe`
   - **Linux**: `nordvpn`
-
 - `search_params`: A list of parameters for the `/api/torrent/search` API used during the execution of `mtsearch.py update -p`. These parameters determine the scope and type of data retrieved. For a complete list of available parameters, consult the official M-Team API documentation.
   Common parameters include:
   - `mode`: Determines the type of content to search. Available values are `normal`, `adult`, `movie`, `music`, `tvshow`, `waterfall`, `rss`, `rankings`.
@@ -76,13 +71,14 @@ Example Configuration:
 #### For searching
 
 ```
-usage: mtsearch.py search [-h] [-e | -f | -m] [pattern]
+usage: mtsearch.py search [-h] [--profile PROFILE] [-e | -f | -m] [pattern]
 
 positional arguments:
   pattern      specify the search pattern
 
 options:
   -h, --help   show this help message and exit
+  --profile PROFILE  profile directory (default: <script_dir>/profile)
   -e, --regex  use regular expression matching
   -f, --fixed  use fixed-string FTS5 matching (default)
   -m, --fts    use freeform FTS5 matching
@@ -107,17 +103,18 @@ options:
 #### For updating
 
 ```
-usage: mtsearch.py update [-h] [-d DUMP_DIR] [--no-limit] (-p [PAGES] | -i ID [ID ...] | --recreate)
+usage: mtsearch.py update [-h] [--profile PROFILE] [-d DUMP_DIR] [--no-limit] (-p [PAGES] | -i ID [ID ...] | --recreate)
 
 options:
   -h, --help      show this help message and exit
+  --profile PROFILE  profile directory (default: <script_dir>/profile)
   -d DUMP_DIR     save torrent files to this directory
   --no-limit      temporarily disable rate limiting
 
 actions:
   -p [PAGES]      scrape one or more pages (format: 'stop' or 'start-stop', default: 1-3)
   -i ID [ID ...]  update one or more torrent IDs
-  --recreate      recreate the database
+  --recreate      recreate the database (retain data)
 ```
 
 - Scrape the 5 most recent pages, bypassing the rate limiter.
@@ -130,7 +127,7 @@ actions:
 
 ## Data File
 
-A SQLite database named `data.db` will be created in the script's directory, storing all scraped torrent data. Ensure you back up this database as needed.
+A SQLite database named `data.db` will be created in the profile directory, storing all scraped torrent data. Ensure you back up this database as needed.
 
 ## API throttling:
 
