@@ -35,6 +35,7 @@ import sys
 import time
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timezone
 from operator import attrgetter
 from pathlib import Path
 from typing import Iterable, List
@@ -48,7 +49,7 @@ _DOMAIN = "https://api.m-team.cc"
 logger = logging.getLogger(__name__)
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(slots=True)
 class Torrent:
     """Data class to hold the details of a torrent."""
 
@@ -265,201 +266,6 @@ class Database:
         new_conn.close()
 
 
-class Searcher:
-
-    not_regex = frozenset(r"[]{}().*?+\|^$").isdisjoint
-
-    def __init__(self, db: Database) -> None:
-        self.db = db
-        self._categories = None
-
-    @property
-    def categories(self):
-        if self._categories is None:
-            self._categories = self.db.get_categories()
-        return self._categories
-
-    def search_print(self, pattern: str, mode: str):
-        """Perform a search in the database and print the results."""
-        sec = time.perf_counter()
-        result = self.search(pattern, mode)
-        sec = time.perf_counter() - sec
-
-        # Sort by id
-        result.sort(key=attrgetter("id"))
-
-        # Print search results
-        sep = "=" * 80 + "\n"
-        f1 = "{:>5}: {}\n".format
-        f2 = "{:>5}: {}  [{}]\n".format
-        f3 = "{:>5}  {}  [{}]\n".format
-        write = sys.stdout.write
-        cat_get = self.categories.get
-
-        for t in result:
-            write(sep)
-            write(f1("ID", t.id))
-            write(f1("Cat", cat_get(t.category, "Unknown")))
-            write(f1("Title", t.title))
-            write(f1("Name", t.name))
-            write(f1("Date", strftime(t.date)))
-            write(f1("Size", humansize(t.length)))
-            write(f1("URL", f"https://kp.m-team.cc/detail/{t.id}"))
-            if t.files:
-                files = iter(t.files)
-                p, l = next(files)
-                write(f2("Files", p, humansize(l)))
-                for p, l in files:
-                    write(f3("", p, humansize(l)))
-
-        write(
-            f"{sep}Found {len(result):,} results in {self.db.get_total():,} torrents ({sec:.4f} seconds).\n"
-        )
-
-    def search(self, pattern: str, mode: str) -> List[Torrent]:
-        """
-        Perform a search on the database based on the given pattern and search mode.
-
-        Args:
-            pattern: The search pattern.
-            search_mode: The search mode, either 'fixed', 'fts', or 'regex'.
-
-        Returns:
-            A list of Torrent objects.
-        """
-
-        # Full-Text Search (FTS) based search
-        if mode in ("fixed", "fts"):
-            result = self._common_search(
-                q1="""
-                SELECT rowid, *
-                FROM torrents_fts
-                WHERE title MATCH :pat OR name MATCH :pat
-                """,
-                q2="""
-                SELECT files_fts.path, files_fts.length, torrents.*
-                FROM files_fts
-                JOIN torrents ON files_fts.id = torrents.id
-                WHERE files_fts.path MATCH :pat
-                """,
-                param={"pat": f'"{pattern}"' if mode == "fixed" else pattern},
-                c=self.db.c,
-            )
-
-        # Regular expression search
-        elif mode == "regex":
-            # For patterns that do not contain any regex metacharacters, while
-            # containing word characters, convert to a fuzzy regex.
-            if self.not_regex(pattern) and re.search(r"[^\W_]", pattern):
-                pattern = re.sub(r"[\W_]+", r"[\\W_]*", pattern)
-
-            result = self._regex_search(pattern)
-
-        else:
-            raise ValueError(f"Invalid search mode: {mode}")
-
-        return list(result.values())
-
-    def _regex_search(self, pattern: str):
-        """Perform a regular expression search using multi-processing."""
-
-        result = {}
-        futures = []
-        query = "SELECT id FROM torrents ORDER BY id LIMIT 1 OFFSET ?"
-        db = self.db
-        args = (
-            Searcher._re_worker,
-            db.path.as_uri() + "?mode=ro",  # read-only
-            re.compile(pattern, re.IGNORECASE).search,
-        )
-
-        with ProcessPoolExecutor() as ex:
-            # Note: Using `ex._max_workers` to get the number of workers.
-            per_worker, remainder = divmod(db.get_total(), ex._max_workers)
-
-            # Query boundary IDs and distribute tasks among workers
-            row = 0
-            start_id = db.c.execute(query, (0,)).fetchone()[0]
-            for _ in range(ex._max_workers):
-                row += per_worker
-                if remainder > 0:
-                    row += 1
-                    remainder -= 1
-                end_id = db.c.execute(query, (row - 1,)).fetchone()[0]
-                futures.append(ex.submit(*args, start_id, end_id))
-                start_id = end_id
-
-            # Collect multi-processing results
-            futures = as_completed(futures)
-            for future in futures:
-                result.update(future.result())
-
-        return result
-
-    @staticmethod
-    def _re_worker(uri: str, searcher, start_id: int, end_id: int):
-        """
-        Worker function to perform regex search on a chunk of data in a
-        multi-processing environment.
-
-        Args:
-            uri: The uri path to the SQLite database.
-            searcher: The search method of a compiled regex pattern.
-            start_id: The starting ID for the range of rows this worker will handle.
-            end_id: The ending ID for the range of rows this worker will handle.
-        """
-
-        # Establish a new database connection for this worker
-        conn = sqlite3.connect(uri, uri=True)
-        conn.create_function(
-            "RESEARCH", 1, lambda s: searcher(s) is not None, deterministic=True
-        )
-
-        # Perform the regex search using the common search method and close the connection.
-        result = Searcher._common_search(
-            q1="""
-            SELECT * FROM torrents
-            WHERE id BETWEEN ? AND ?
-            AND (RESEARCH(title) OR RESEARCH(name))
-            """,
-            q2="""
-            SELECT files.path, files.length, torrents.*
-            FROM files
-            JOIN torrents ON files.id = torrents.id
-            WHERE torrents.id BETWEEN ? AND ? AND RESEARCH(files.path)
-            """,
-            param=(start_id, end_id),
-            c=conn.cursor(),
-        )
-        conn.close()
-
-        return result
-
-    @staticmethod
-    def _common_search(q1: str, q2: str, param, c: sqlite3.Cursor):
-        """
-        Execute common search queries for torrents and files.
-
-        Args:
-            q1: SQL query for torrents table.
-            q2: SQL query for files table.
-            param: Parameters for the SQL query.
-            c: SQLite cursor object.
-
-        Returns:
-            A dictionary of Torrent objects.
-        """
-        result = {}
-        for tid, *torrent in c.execute(q1, param):
-            result[tid] = Torrent(tid, *torrent)
-        for path, length, tid, *torrent in c.execute(q2, param):
-            t = result.get(tid)
-            if t is None:
-                t = result[tid] = Torrent(tid, *torrent)
-            t.files.append((path, length))
-        return result
-
-
 class RateLimiter:
     """
     A rate limiter for controlling global and per-request frequencies. None or
@@ -553,10 +359,10 @@ class CriticalAPIError(APIError):
 
 
 class MTeamScraper:
-    """A scraper for M-Team."""
+    """A scraper for M-Team torrent sites."""
 
     _PAGE_SIZE: int = 200
-    _THROTTLE_TIMMER: int = 120
+    _THROTTLE_TIMER: int = 120
 
     def __init__(
         self,
@@ -613,6 +419,7 @@ class MTeamScraper:
                 total=5,
                 status_forcelist={429, 500, 502, 503, 504, 521, 524},
                 backoff_factor=0.5,
+                allowed_methods=None,
             )
         )
         s.mount("http://", adapter)
@@ -695,7 +502,10 @@ class MTeamScraper:
 
         for item in items:
             try:
+                # id
                 tid = int(item["id"])
+                if tid < 0:
+                    raise ValueError(f"Invalid torrent ID '{tid}'.")
                 # title
                 title = item["name"].strip()
                 if not (isinstance(title, str) and title):
@@ -703,7 +513,7 @@ class MTeamScraper:
                 # category
                 category = get_int(item, "category")
                 if category <= 0:
-                    logger.error("ID: %s. Invalid category: '%s'.", tid, category)
+                    raise ValueError(f'Invalid category "{item.get("category")}".')
                 # check and update existing torrent
                 if check_and_update(tid, category, title):
                     continue
@@ -730,7 +540,7 @@ class MTeamScraper:
                         for f in files
                     ]
                     if not all(f[1] and f[2] >= 0 for f in files):
-                        logger.error("ID: %s. Invalid file path.", tid)
+                        logger.error("Invalid file list in torrent %s", tid)
                     length = sum(f[2] for f in files)
                 else:
                     files = ()
@@ -749,7 +559,7 @@ class MTeamScraper:
             except CriticalAPIError:
                 raise
             except Exception as e:
-                logger.error("ID: %s. %s", item.get("id"), e)
+                logger.error("ID: %s. %s", item.get("id", "<unknown>"), e)
 
     def _request_api(self, path: str, ratelimit: bool = True, **kwargs):
         """Make a POST request to the API and return JSON response."""
@@ -787,9 +597,9 @@ class MTeamScraper:
                 self._init_session()
             else:
                 logger.info(
-                    "Throttled. Waiting for %ss. (%s)", self._THROTTLE_TIMMER, message
+                    "Throttled. Waiting for %ss. (%s)", self._THROTTLE_TIMER, message
                 )
-                time.sleep(self._THROTTLE_TIMMER)
+                time.sleep(self._THROTTLE_TIMER)
         elif "key無效" in message:
             raise CriticalAPIError(f"Invalid API key. ({message})")
         else:
@@ -838,6 +648,194 @@ class MTeamScraper:
         return content
 
 
+class TorrentSearcher:
+    """A searcher for torrents in the local database."""
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+        self._categories = None
+
+    @property
+    def categories(self):
+        if self._categories is None:
+            self._categories = self.db.get_categories()
+        return self._categories
+
+    def search_print(self, pattern: str, mode: str):
+        """Perform a search in the database and print the results."""
+        sec = time.perf_counter()
+        result = self.search(pattern, mode)
+        sec = time.perf_counter() - sec
+
+        # Sort by id
+        result.sort(key=attrgetter("id"))
+
+        # Print search results
+        sep = "=" * 80 + "\n"
+        f1 = "{:>5}: {}\n".format
+        f2 = "{:>5}: {}  [{}]\n".format
+        f3 = "{:>5}  {}  [{}]\n".format
+        write = sys.stdout.write
+        cat_get = self.categories.get
+
+        for t in result:
+            write(sep)
+            write(f1("ID", t.id))
+            write(f1("Cat", cat_get(t.category, "Unknown")))
+            write(f1("Title", t.title))
+            write(f1("Name", t.name))
+            write(f1("Date", strftime(t.date)))
+            write(f1("Size", humansize(t.length)))
+            write(f1("URL", f"https://kp.m-team.cc/detail/{t.id}"))
+            if t.files:
+                files = iter(t.files)
+                p, l = next(files)
+                write(f2("Files", p, humansize(l)))
+                for p, l in files:
+                    write(f3("", p, humansize(l)))
+
+        write(
+            f"{sep}Found {len(result):,} results in {self.db.get_total():,} torrents ({sec:.4f} seconds).\n"
+        )
+
+    def search(self, pattern: str, mode: str) -> List[Torrent]:
+        """
+        Perform a search on the database based on the given pattern and search mode.
+        """
+
+        # Full-Text Search (FTS) based search
+        if mode in ("fts", "literal"):
+            if mode == "literal":
+                pattern = '"{}"'.format(pattern.replace('"', '""'))
+            result = _common_search(
+                tsql="""
+                SELECT rowid, *
+                FROM torrents_fts
+                WHERE title MATCH :pat OR name MATCH :pat
+                """,
+                fsql="""
+                SELECT files_fts.path, files_fts.length, torrents.*
+                FROM files_fts
+                JOIN torrents ON torrents.id = files_fts.id
+                WHERE files_fts.path MATCH :pat
+                """,
+                param={"pat": pattern},
+                c=self.db.c,
+            )
+
+        # Regular expression search
+        elif mode == "regex":
+            try:
+                _get_re_searcher(pattern)
+            except re.error as e:
+                raise ValueError(f'Invalid regular expression "{pattern}": {e}') from e
+            result = self._regex_search(pattern)
+
+        else:
+            raise ValueError(f"Invalid search mode: {mode}")
+
+        return list(result.values())
+
+    def _regex_search(self, pattern: str):
+        """Perform a regular expression search using multi-processing."""
+        result = {}
+        futures = []
+        query = "SELECT id FROM torrents ORDER BY id LIMIT 1 OFFSET ?"
+        db = self.db
+        args = (_re_worker, db.path.as_uri() + "?mode=ro", pattern)  # read-only
+
+        with ProcessPoolExecutor() as ex:
+            # Note: Using `ex._max_workers` to get the number of workers.
+            per_worker, remainder = divmod(db.get_total(), ex._max_workers)
+
+            # Query boundary IDs and distribute tasks among workers
+            row = 0
+            start_id = db.c.execute(query, (0,)).fetchone()[0]
+            for _ in range(ex._max_workers):
+                row += per_worker
+                if remainder > 0:
+                    row += 1
+                    remainder -= 1
+                end_id = db.c.execute(query, (row - 1,)).fetchone()[0]
+                futures.append(ex.submit(*args, start_id, end_id))
+                start_id = end_id + 1
+
+            # Collect multi-processing results
+            futures = as_completed(futures)
+            for future in futures:
+                result.update(future.result())
+
+        return result
+
+
+def _get_re_searcher(pattern: str):
+    """Return a search method for the given regex pattern."""
+    f = re.compile(pattern, re.IGNORECASE).search
+    return lambda s: f(s) is not None
+
+
+def _re_worker(uri: str, pattern: str, start_id: int, end_id: int):
+    """
+    Worker function to perform regex search on a chunk of data in a
+    multi-processing environment.
+
+    Args:
+        uri: The uri path to the SQLite database.
+        pattern: The regex pattern to search for.
+        start_id: The starting ID for the range of rows this worker will handle.
+        end_id: The ending ID for the range of rows this worker will handle.
+    """
+
+    # Establish a new database connection for this worker
+    conn = sqlite3.connect(uri, uri=True)
+    conn.create_function("RESEARCH", 1, _get_re_searcher(pattern), deterministic=True)
+
+    # Perform the regex search using the common search method and close the connection.
+    result = _common_search(
+        tsql="""
+        SELECT * FROM torrents
+        WHERE id BETWEEN ? AND ?
+        AND (RESEARCH(title) OR RESEARCH(name))
+        """,
+        fsql="""
+        SELECT files.path, files.length, torrents.*
+        FROM files
+        JOIN torrents ON torrents.id = files.id
+        WHERE files.id BETWEEN ? AND ?
+        AND RESEARCH(files.path)
+        """,
+        param=(start_id, end_id),
+        c=conn.cursor(),
+    )
+    conn.close()
+
+    return result
+
+
+def _common_search(tsql: str, fsql: str, param, c: sqlite3.Cursor):
+    """
+    Execute common search queries for torrents and files.
+
+    Args:
+        tsql: SQL query for torrents table.
+        fsql: SQL query for files table.
+        param: Parameters for the SQL query.
+        c: SQLite cursor object.
+
+    Returns:
+        A dictionary of Torrent objects.
+    """
+    result = {}
+    for tid, *torrent in c.execute(tsql, param):
+        result[tid] = Torrent(tid, *torrent)
+    for path, length, tid, *torrent in c.execute(fsql, param):
+        t = result.get(tid)
+        if t is None:
+            t = result[tid] = Torrent(tid, *torrent)
+        t.files.append((path, length))
+    return result
+
+
 def get_int(d: dict, k) -> int:
     """Return the integer value for key k in dict d, or 0 if invalid."""
     try:
@@ -846,18 +844,18 @@ def get_int(d: dict, k) -> int:
         return 0
 
 
-def strptime(string: str, fmt: str = "%Y-%m-%d %H:%M:%S") -> int:
-    """Convert a date string to epoch time."""
+def strptime(s: str, fmt: str = "%Y-%m-%d %H:%M:%S") -> int:
+    """Convert a formatted date string to UTC epoch time."""
     try:
-        return int(time.mktime(time.strptime(string, fmt)))
+        return int(datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp())
     except (TypeError, ValueError):
         return 0
 
 
 def strftime(epoch: int, fmt: str = "%F") -> str:
-    """Convert epoch time to a formatted date string."""
-    if epoch is None:
-        raise TypeError("Epoch argument cannot be None.")
+    """Convert UTC epoch time to a formatted date string."""
+    if not isinstance(epoch, (int, float)):
+        raise ValueError("Epoch time must be an integer or float.")
     return time.strftime(fmt, time.gmtime(epoch))
 
 
@@ -868,8 +866,8 @@ def humansize(size) -> str:
         return "0.00 B"
     units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB")
     idx = (abs(size).bit_length() - 1) // 10
-    if idx >= len(units):
-        idx = len(units) - 1
+    if idx > 8:  # len(units) - 1
+        idx = 8
     return f"{size / (1 << (idx * 10)):.2f} {units[idx]}"
 
 
@@ -904,7 +902,7 @@ def parse_args():
 A M-Team scraper and search utility.
 
 Scrapes torrent data from M-Team website and stores it in a local database.
-Supports SQLite FTS5 and regular expression matching.
+Supports SQLite FTS5 and regular expression searching.
 
 Author: David Pi
 Contributor: ChatGPT - OpenAI""",
@@ -914,6 +912,7 @@ Contributor: ChatGPT - OpenAI""",
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
+        "-P",
         "--profile",
         type=Path,
         help="profile directory (default: <script_dir>/profile)",
@@ -927,7 +926,7 @@ Contributor: ChatGPT - OpenAI""",
         epilog="""\
 examples:
   %(prog)s "foo"
-  %(prog)s -m "foo OR bar"
+  %(prog)s -l "foo OR bar"
   %(prog)s -e "202[2-4]"
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -941,30 +940,30 @@ examples:
         help="specify the search pattern",
     )
     exgroup = subparser.add_mutually_exclusive_group()
-    exgroup.set_defaults(search_mode="fixed")
+    exgroup.set_defaults(search_mode="fts")
+    exgroup.add_argument(
+        "-f",
+        "--fts",
+        dest="search_mode",
+        action="store_const",
+        const="fts",
+        help="use FTS5 matching (default)",
+    )
+    exgroup.add_argument(
+        "-l",
+        "--literal",
+        dest="search_mode",
+        action="store_const",
+        const="literal",
+        help="use literal string FTS5 matching (operators disabled)",
+    )
     exgroup.add_argument(
         "-e",
         "--regex",
         dest="search_mode",
         action="store_const",
         const="regex",
-        help="use regular expression matching",
-    )
-    exgroup.add_argument(
-        "-f",
-        "--fixed",
-        dest="search_mode",
-        action="store_const",
-        const="fixed",
-        help="use fixed-string FTS5 matching (default)",
-    )
-    exgroup.add_argument(
-        "-m",
-        "--fts",
-        dest="search_mode",
-        action="store_const",
-        const="fts",
-        help="use freeform FTS5 matching",
+        help="use regular expression searching",
     )
 
     # update
@@ -974,7 +973,7 @@ examples:
         help="update the database",
         epilog="""\
 examples:
-  %(prog)s -p 1-10
+  %(prog)s -p 10-20
   %(prog)s -i 3 5 7
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -992,15 +991,16 @@ examples:
         action="store_true",
         help="temporarily disable rate limiting",
     )
-    exgroup = subparser.add_argument_group("actions")
-    exgroup = exgroup.add_mutually_exclusive_group(required=True)
+    exgroup = subparser.add_argument_group(
+        "actions",
+        description="If no action is provided, defaults to: -p 3.",
+    )
+    exgroup = exgroup.add_mutually_exclusive_group(required=False)
     exgroup.add_argument(
         "-p",
         dest="pages",
         type=_parse_range,
-        const="1-3",
-        nargs="?",
-        help="scrape one or more pages (format: 'stop' or 'start-stop', default: %(const)s)",
+        help="scrape one or more listing pages (e.g., '1-5' or '3')",
     )
     exgroup.add_argument(
         "-i",
@@ -1016,7 +1016,12 @@ examples:
         help="recreate the database",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.mode == "update" and not (args.recreate or args.pages or args.id):
+        args.pages = range(1, 4)
+
+    return args
 
 
 def _parse_range(string: str):
@@ -1069,8 +1074,7 @@ def main():
     try:
         if args.mode == "search":
             init_logger()  # log to console only
-
-            searcher = Searcher(db)
+            searcher = TorrentSearcher(db)
 
             if args.pattern:
                 searcher.search_print(args.pattern, args.search_mode)
@@ -1111,6 +1115,7 @@ def main():
 
     except Exception as e:
         logger.critical(e)
+        sys.exit(1)
 
     finally:
         db.close()

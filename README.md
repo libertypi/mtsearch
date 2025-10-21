@@ -2,7 +2,7 @@
 
 ## Description
 
-MTSearch is a powerful utility for scraping torrent data from M-Team torrent sites and storing it in a local database for fast searching. It supports various search modes including fixed-string matching, SQLite FTS5 matching, and regular expression matching.
+MTSearch is a powerful utility for scraping torrent data from M-Team torrent sites and storing it in a local database for fast searching. It supports various search modes including SQLite FTS5 matching and regular expression searching.
 
 ### Features
 - **Automatic Scraping**: Scrape torrent data across a range of pages as specified.
@@ -25,7 +25,7 @@ pip install -r requirements.txt
 ## Usage
 
 1. Upon the first run, a default configuration file (`config.json`) will be generated in the profile directory (default: `<script_dir>/profile`). Edit this config file before running this script again.
-2. Scrape some data into the database: `mtsearch.py update -p`
+2. Scrape some data into the database: `mtsearch.py update`
 3. Perform searches: `mtsearch.py search "your keyword"`
 
 ### Configuration File
@@ -37,14 +37,14 @@ The script uses a configuration file (`config.json`) with the following fields:
 - `request_interval`: The time interval (in seconds) between each API request. Set to `0` to make requests without any delay.
 - `hourly_limit`: The maximum number of requests permitted per hour. Set to `0` for no limit.
 - `nordvpn_path`: The file path to the NordVPN executable, used to manage IP rotation and bypass throttling. Ensure the NordVPN client is installed. Common paths include:
-  - **Windows**: `C:\Program Files\NordVPN\nordvpn.exe`
   - **Linux**: `nordvpn`
+  - **Windows**: `C:\Program Files\NordVPN\nordvpn.exe`
 - `search_params`: A list of parameters for the `/api/torrent/search` API used during the execution of `mtsearch.py update -p`. These parameters determine the scope and type of data retrieved. For a complete list of available parameters, consult the official M-Team API documentation.
   Common parameters include:
   - `mode`: Determines the type of content to search. Available values are `normal`, `adult`, `movie`, `music`, `tvshow`, `waterfall`, `rss`, `rankings`.
   - `categories`: An array of integers that identify specific categories within a selected mode. An empty array includes all categories.
 
-Example Configuration:
+Example `config.json`:
 
 ```json
 {
@@ -71,30 +71,37 @@ Example Configuration:
 #### For searching
 
 ```
-usage: mtsearch.py search [-h] [--profile PROFILE] [-e | -f | -m] [pattern]
+usage: mtsearch.py search [-h] [-P PROFILE] [-f | -l | -e] [pattern]
 
 positional arguments:
-  pattern      specify the search pattern
+  pattern               specify the search pattern
 
 options:
-  -h, --help   show this help message and exit
-  --profile PROFILE  profile directory (default: <script_dir>/profile)
-  -e, --regex  use regular expression matching
-  -f, --fixed  use fixed-string FTS5 matching (default)
-  -m, --fts    use freeform FTS5 matching
+  -h, --help            show this help message and exit
+  -P, --profile PROFILE
+                        profile directory (default: <script_dir>/profile)
+  -f, --fts             use FTS5 matching (default)
+  -l, --literal         use literal string FTS5 matching (operators disabled)
+  -e, --regex           use regular expression searching
+
+examples:
+  mtsearch.py search "foo"
+  mtsearch.py search -l "foo OR bar"
+  mtsearch.py search -e "202[2-4]"
 ```
 
-- Enter interactive search mode (use -e, -f, -m to specify search modes):
+- Enter interactive search mode (use -f, -l, -e to specify search modes):
 
   `mtsearch.py search` or `mtsearch.py s`
 
-- Search for a specific keyword (equivalent to using -f):
+- Search using [FTS5](https://www.sqlite.org/fts5.html) syntax (equivalent to using -f):
 
   `mtsearch.py search "foo"`
+  `mtsearch.py search "foo OR bar"`
 
-- Search using [FTS5](https://www.sqlite.org/fts5.html) syntax (without -m, the 'OR' operator is treated literally):
+- Search using literal string matching (with -l, the 'OR' operator is treated literally here):
 
-  `mtsearch.py search -m "foo OR bar"`
+  `mtsearch.py search -l "foo OR bar"`
 
 - Search using a regular expression (e.g., matches 2022, 2023, 2024):
 
@@ -103,18 +110,25 @@ options:
 #### For updating
 
 ```
-usage: mtsearch.py update [-h] [--profile PROFILE] [-d DUMP_DIR] [--no-limit] (-p [PAGES] | -i ID [ID ...] | --recreate)
+usage: mtsearch.py update [-h] [-P PROFILE] [-d DUMP_DIR] [--no-limit] [-p PAGES | -i ID [ID ...] | --recreate]
 
 options:
-  -h, --help      show this help message and exit
-  --profile PROFILE  profile directory (default: <script_dir>/profile)
-  -d DUMP_DIR     save torrent files to this directory
-  --no-limit      temporarily disable rate limiting
+  -h, --help            show this help message and exit
+  -P, --profile PROFILE
+                        profile directory (default: <script_dir>/profile)
+  -d DUMP_DIR           save torrent files to this directory
+  --no-limit            temporarily disable rate limiting
 
 actions:
-  -p [PAGES]      scrape one or more pages (format: 'stop' or 'start-stop', default: 1-3)
-  -i ID [ID ...]  update one or more torrent IDs
-  --recreate      recreate the database (retain data)
+  If no action is provided, defaults to: -p 3.
+
+  -p PAGES              scrape one or more listing pages (e.g., '1-5' or '3')
+  -i ID [ID ...]        update one or more torrent IDs
+  --recreate            recreate the database
+
+examples:
+  mtsearch.py update -p 10-20
+  mtsearch.py update -i 3 5 7
 ```
 
 - Scrape the 5 most recent pages, bypassing the rate limiter.
@@ -131,7 +145,7 @@ A SQLite database named `data.db` will be created in the profile directory, stor
 
 ## API throttling:
 
-> **Note**: Currently, M-Team appears to implement API throttling dynamically. You're free to experiment with different settings of rate limiting until you get banned. For scraping a small number of pages, use the `--no-limit` switch to temporarily disable the rate limiter.
+> **Note**: Currently, M-Team implements dynamic and daily API throttling. You're free to experiment with different rate limitings until you get banned. For scraping a small number of pages, use the `--no-limit` switch to temporarily disable the rate limiter.
 
 ## Authors
 

@@ -1,8 +1,8 @@
-.vscode
-profile*/
-*.db
+.vscode/
+profile/
+config*.json
 *.log
-config.*
+*.db
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
