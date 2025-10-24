@@ -701,8 +701,7 @@ class TorrentSearcher:
         """
         Perform a search on the database based on the given pattern and search mode.
         """
-
-        # Full-Text Search (FTS) based search
+        # FTS search
         if mode in ("literal", "fts"):
             if mode == "literal":
                 pattern = '"{}"'.format(pattern.replace('"', '""'))
@@ -740,23 +739,23 @@ class TorrentSearcher:
         result = {}
         futures = []
         db = self.db
-        args = (_re_worker, db.path.as_uri() + "?mode=ro", pattern)  # read-only
 
         lo, hi = db.c.execute("SELECT MIN(id), MAX(id) FROM torrents").fetchone()
         if lo is None:  # Empty database
             return result
 
-        with ProcessPoolExecutor() as ex:
-            W = ex._max_workers
-            step = ceil((hi - lo + 1) / W)
+        with ProcessPoolExecutor(
+            initializer=_initializer,
+            initargs=(db.path.as_uri() + "?mode=ro", pattern),
+        ) as ex:
+            # divide into (workers * 16) chunks to mitigate sparse IDs
+            step = ceil((hi - lo + 1) / (ex._max_workers * 16))
 
             a = lo
-            for _ in range(W):
-                b = min(hi, a + step - 1)
-                futures.append(ex.submit(*args, a, b))
+            while a <= hi:
+                b = min(a + step - 1, hi)
+                futures.append(ex.submit(_re_worker, a, b))
                 a = b + 1
-                if a > hi:
-                    break
 
             for fut in as_completed(futures):
                 result.update(fut.result())
@@ -770,24 +769,22 @@ def _get_research(pattern: str):
     return lambda s: f(s) is not None
 
 
-def _re_worker(uri: str, pattern: str, start_id: int, end_id: int):
+_CONN = None
+
+
+def _initializer(db_uri: str, pattern: str):
+    """Initializer for worker processes."""
+    global _CONN
+    _CONN = sqlite3.connect(db_uri, uri=True)
+    _CONN.create_function("RESEARCH", 1, _get_research(pattern), deterministic=True)
+
+
+def _re_worker(start_id: int, end_id: int):
     """
     Worker function to perform regex search on a chunk of data in a
     multi-processing environment.
-
-    Args:
-        uri: The uri path to the SQLite database.
-        pattern: The regex pattern to search for.
-        start_id: The starting ID for the range of rows this worker will handle.
-        end_id: The ending ID for the range of rows this worker will handle.
     """
-
-    # Establish a new database connection for this worker
-    conn = sqlite3.connect(uri, uri=True)
-    conn.create_function("RESEARCH", 1, _get_research(pattern), deterministic=True)
-
-    # Perform the regex search using the common search method and close the connection.
-    result = _common_search(
+    return _common_search(
         tsql="""
         SELECT id, category, title, name, date, length
         FROM torrents
@@ -802,11 +799,8 @@ def _re_worker(uri: str, pattern: str, start_id: int, end_id: int):
         AND RESEARCH(f.path)
         """,
         param=(start_id, end_id),
-        c=conn.cursor(),
+        c=_CONN.cursor(),
     )
-    conn.close()
-
-    return result
 
 
 def _common_search(tsql: str, fsql: str, param, c: sqlite3.Cursor):
