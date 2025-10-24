@@ -36,6 +36,7 @@ import time
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
+from math import ceil
 from operator import attrgetter
 from pathlib import Path
 from typing import Iterable, List
@@ -511,11 +512,11 @@ class MTeamScraper:
                 if not (isinstance(title, str) and title):
                     raise ValueError(f"Invalid title '{title}'.")
                 # category
-                category = get_int(item, "category")
-                if category <= 0:
+                cat = get_int(item, "category")
+                if cat <= 0:
                     raise ValueError(f'Invalid category "{item.get("category")}".')
                 # check and update existing torrent
-                if check_and_update(tid, category, title):
+                if check_and_update(tid, cat, title):
                     continue
                 # download and decode the torrent
                 data = bdecode(self._fetch_torrent(tid))
@@ -541,19 +542,17 @@ class MTeamScraper:
                     ]
                     if not all(f[1] and f[2] >= 0 for f in files):
                         logger.error("Invalid file list in torrent %s", tid)
-                    length = sum(f[2] for f in files)
+                    tlen = sum(f[2] for f in files)
                 else:
                     files = ()
-                    length = get_int(data, b"length")
-                if length <= 0:
-                    length = get_int(item, "size")
-                    if length <= 0:
-                        logger.error(
-                            "ID: %s. Invalid torrent length: '%s'.", tid, length
-                        )
+                    tlen = get_int(data, b"length")
+                if tlen <= 0:
+                    tlen = get_int(item, "size")
+                    if tlen <= 0:
+                        logger.error("ID: %s. Invalid torrent length: '%s'.", tid, tlen)
                 # insert into the database
                 self.db.insert_torrent(
-                    torrent=(tid, category, title, name, date, length),
+                    torrent=(tid, cat, title, name, date, tlen),
                     files=files,
                 )
             except CriticalAPIError:
@@ -681,12 +680,12 @@ class TorrentSearcher:
         for t in result:
             write(sep)
             write(f1("ID", t.id))
-            write(f1("Cat", cat_get(t.category, "Unknown")))
+            write(f1("URL", f"https://kp.m-team.cc/detail/{t.id}"))
             write(f1("Title", t.title))
-            write(f1("Name", t.name))
+            write(f1("Cat", cat_get(t.category, "Unknown")))
             write(f1("Date", strftime(t.date)))
             write(f1("Size", humansize(t.length)))
-            write(f1("URL", f"https://kp.m-team.cc/detail/{t.id}"))
+            write(f1("Name", t.name))
             if t.files:
                 files = iter(t.files)
                 p, l = next(files)
@@ -704,20 +703,20 @@ class TorrentSearcher:
         """
 
         # Full-Text Search (FTS) based search
-        if mode in ("fts", "literal"):
+        if mode in ("literal", "fts"):
             if mode == "literal":
                 pattern = '"{}"'.format(pattern.replace('"', '""'))
             result = _common_search(
                 tsql="""
-                SELECT rowid, *
+                SELECT rowid, category, title, name, date, length
                 FROM torrents_fts
                 WHERE title MATCH :pat OR name MATCH :pat
                 """,
                 fsql="""
-                SELECT files_fts.path, files_fts.length, torrents.*
-                FROM files_fts
-                JOIN torrents ON torrents.id = files_fts.id
-                WHERE files_fts.path MATCH :pat
+                SELECT t.id, t.category, t.title, t.name, t.date, t.length, f.path, f.length
+                FROM files_fts AS f
+                JOIN torrents AS t ON f.id = t.id
+                WHERE f.path MATCH :pat
                 """,
                 param={"pat": pattern},
                 c=self.db.c,
@@ -726,7 +725,7 @@ class TorrentSearcher:
         # Regular expression search
         elif mode == "regex":
             try:
-                _get_re_searcher(pattern)
+                _get_research(pattern)
             except re.error as e:
                 raise ValueError(f'Invalid regular expression "{pattern}": {e}') from e
             result = self._regex_search(pattern)
@@ -740,35 +739,32 @@ class TorrentSearcher:
         """Perform a regular expression search using multi-processing."""
         result = {}
         futures = []
-        query = "SELECT id FROM torrents ORDER BY id LIMIT 1 OFFSET ?"
         db = self.db
         args = (_re_worker, db.path.as_uri() + "?mode=ro", pattern)  # read-only
 
+        lo, hi = db.c.execute("SELECT MIN(id), MAX(id) FROM torrents").fetchone()
+        if lo is None:  # Empty database
+            return result
+
         with ProcessPoolExecutor() as ex:
-            # Note: Using `ex._max_workers` to get the number of workers.
-            per_worker, remainder = divmod(db.get_total(), ex._max_workers)
+            W = ex._max_workers
+            step = ceil((hi - lo + 1) / W)
 
-            # Query boundary IDs and distribute tasks among workers
-            row = 0
-            start_id = db.c.execute(query, (0,)).fetchone()[0]
-            for _ in range(ex._max_workers):
-                row += per_worker
-                if remainder > 0:
-                    row += 1
-                    remainder -= 1
-                end_id = db.c.execute(query, (row - 1,)).fetchone()[0]
-                futures.append(ex.submit(*args, start_id, end_id))
-                start_id = end_id + 1
+            a = lo
+            for _ in range(W):
+                b = min(hi, a + step - 1)
+                futures.append(ex.submit(*args, a, b))
+                a = b + 1
+                if a > hi:
+                    break
 
-            # Collect multi-processing results
-            futures = as_completed(futures)
-            for future in futures:
-                result.update(future.result())
+            for fut in as_completed(futures):
+                result.update(fut.result())
 
         return result
 
 
-def _get_re_searcher(pattern: str):
+def _get_research(pattern: str):
     """Return a search method for the given regex pattern."""
     f = re.compile(pattern, re.IGNORECASE).search
     return lambda s: f(s) is not None
@@ -788,21 +784,22 @@ def _re_worker(uri: str, pattern: str, start_id: int, end_id: int):
 
     # Establish a new database connection for this worker
     conn = sqlite3.connect(uri, uri=True)
-    conn.create_function("RESEARCH", 1, _get_re_searcher(pattern), deterministic=True)
+    conn.create_function("RESEARCH", 1, _get_research(pattern), deterministic=True)
 
     # Perform the regex search using the common search method and close the connection.
     result = _common_search(
         tsql="""
-        SELECT * FROM torrents
+        SELECT id, category, title, name, date, length
+        FROM torrents
         WHERE id BETWEEN ? AND ?
         AND (RESEARCH(title) OR RESEARCH(name))
         """,
         fsql="""
-        SELECT files.path, files.length, torrents.*
-        FROM files
-        JOIN torrents ON torrents.id = files.id
-        WHERE files.id BETWEEN ? AND ?
-        AND RESEARCH(files.path)
+        SELECT t.id, t.category, t.title, t.name, t.date, t.length, f.path, f.length
+        FROM files as f
+        JOIN torrents as t ON f.id = t.id
+        WHERE f.id BETWEEN ? AND ?
+        AND RESEARCH(f.path)
         """,
         param=(start_id, end_id),
         c=conn.cursor(),
@@ -826,13 +823,27 @@ def _common_search(tsql: str, fsql: str, param, c: sqlite3.Cursor):
         A dictionary of Torrent objects.
     """
     result = {}
-    for tid, *torrent in c.execute(tsql, param):
-        result[tid] = Torrent(tid, *torrent)
-    for path, length, tid, *torrent in c.execute(fsql, param):
+    for tid, cat, title, name, date, tlen in c.execute(tsql, param):
+        result[tid] = Torrent(
+            id=tid,
+            category=cat,
+            title=title,
+            name=name,
+            date=date,
+            length=tlen,
+        )
+    for tid, cat, title, name, date, tlen, fpath, flen in c.execute(fsql, param):
         t = result.get(tid)
         if t is None:
-            t = result[tid] = Torrent(tid, *torrent)
-        t.files.append((path, length))
+            t = result[tid] = Torrent(
+                id=tid,
+                category=cat,
+                title=title,
+                name=name,
+                date=date,
+                length=tlen,
+            )
+        t.files.append((fpath, flen))
     return result
 
 
@@ -926,7 +937,7 @@ Contributor: ChatGPT - OpenAI""",
         epilog="""\
 examples:
   %(prog)s "foo"
-  %(prog)s -l "foo OR bar"
+  %(prog)s -f "foo OR bar"
   %(prog)s -e "202[2-4]"
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -940,22 +951,22 @@ examples:
         help="specify the search pattern",
     )
     exgroup = subparser.add_mutually_exclusive_group()
-    exgroup.set_defaults(search_mode="fts")
-    exgroup.add_argument(
-        "-f",
-        "--fts",
-        dest="search_mode",
-        action="store_const",
-        const="fts",
-        help="use FTS5 matching (default)",
-    )
+    exgroup.set_defaults(search_mode="literal")
     exgroup.add_argument(
         "-l",
         "--literal",
         dest="search_mode",
         action="store_const",
         const="literal",
-        help="use literal string FTS5 matching (operators disabled)",
+        help="use literal FTS5 matching (default)",
+    )
+    exgroup.add_argument(
+        "-f",
+        "--fts",
+        dest="search_mode",
+        action="store_const",
+        const="fts",
+        help="use FTS5 matching (operators enabled)",
     )
     exgroup.add_argument(
         "-e",
@@ -1058,16 +1069,19 @@ def parse_config(config_path: Path) -> dict:
         sys.exit(f"The configuration file at '{config_path}' is malformed.")
 
 
+def ensure_profile(profile: Path | None) -> Path:
+    if profile:
+        profile = profile.resolve()
+    else:
+        profile = Path(__file__).parent.resolve().joinpath("profile")
+    profile.mkdir(parents=True, exist_ok=True)
+    return profile
+
+
 def main():
 
     args = parse_args()
-
-    if args.profile:
-        profile = args.profile
-    else:
-        profile = Path(__file__).parent.joinpath("profile")
-    profile.mkdir(parents=True, exist_ok=True)
-
+    profile = ensure_profile(args.profile)
     conf = parse_config(profile.joinpath("config.json"))
     db = Database(profile.joinpath("data.db"))
 

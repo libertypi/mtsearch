@@ -71,7 +71,7 @@ Example `config.json`:
 #### For searching
 
 ```
-usage: mtsearch.py search [-h] [-P PROFILE] [-f | -l | -e] [pattern]
+usage: mtsearch.py search [-h] [-P PROFILE] [-l | -f | -e] [pattern]
 
 positional arguments:
   pattern               specify the search pattern
@@ -80,28 +80,27 @@ options:
   -h, --help            show this help message and exit
   -P, --profile PROFILE
                         profile directory (default: <script_dir>/profile)
-  -f, --fts             use FTS5 matching (default)
-  -l, --literal         use literal string FTS5 matching (operators disabled)
+  -l, --literal         use literal FTS5 matching (default)
+  -f, --fts             use FTS5 matching (operators enabled)
   -e, --regex           use regular expression searching
 
 examples:
   mtsearch.py search "foo"
-  mtsearch.py search -l "foo OR bar"
+  mtsearch.py search -f "foo OR bar"
   mtsearch.py search -e "202[2-4]"
 ```
 
-- Enter interactive search mode (use -f, -l, -e to specify search modes):
+- Enter interactive search mode (use -l, -f, -e to specify search modes):
 
   `mtsearch.py search` or `mtsearch.py s`
 
-- Search using [FTS5](https://www.sqlite.org/fts5.html) syntax (equivalent to using -f):
+- Search using default literal FTS5 matching:
 
   `mtsearch.py search "foo"`
-  `mtsearch.py search "foo OR bar"`
 
-- Search using literal string matching (with -l, the 'OR' operator is treated literally here):
+- Search using [FTS5](https://www.sqlite.org/fts5.html) syntax:
 
-  `mtsearch.py search -l "foo OR bar"`
+  `mtsearch.py search -f "foo OR bar"`
 
 - Search using a regular expression (e.g., matches 2022, 2023, 2024):
 
