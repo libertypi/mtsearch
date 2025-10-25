@@ -240,7 +240,7 @@ class Database:
         """Create a new database and insert the current data."""
         dest_path = self.path.with_stem(self.path.stem + "_new")
         if dest_path.exists():
-            raise Exception(f"Destination exists: {dest_path}")
+            raise FileExistsError(f"File already exists: {dest_path}")
 
         logger.info("Creating new database: %s", dest_path)
         new_conn = sqlite3.connect(dest_path)
@@ -249,6 +249,10 @@ class Database:
         new_c.executescript(self._SCHEMA)
         with new_conn:
             new_c.executemany(
+                self._UPD_CATEGORIES,
+                self.c.execute("SELECT * from categories ORDER BY id"),
+            )
+            new_c.executemany(
                 self._INS_TORRENTS,
                 self.c.execute("SELECT * from torrents ORDER BY id"),
             )
@@ -256,13 +260,9 @@ class Database:
                 self._INS_FILES,
                 self.c.execute("SELECT * from files ORDER BY id, rowid"),
             )
-            new_c.executemany(
-                self._UPD_CATEGORIES,
-                self.c.execute("SELECT * from categories ORDER BY id"),
-            )
 
         logger.info("Data copying completed. Optimizing...")
-        new_c.executescript("VACUUM; PRAGMA optimize; ANALYZE;")
+        new_c.executescript("VACUUM; ANALYZE; PRAGMA optimize;")
         logger.info("Database optimization completed.")
         new_conn.close()
 
@@ -666,9 +666,6 @@ class TorrentSearcher:
         result = self.search(pattern, mode)
         sec = time.perf_counter() - sec
 
-        # Sort by id
-        result.sort(key=attrgetter("id"))
-
         # Print search results
         sep = "=" * 80 + "\n"
         f1 = "{:>5}: {}\n".format
@@ -703,8 +700,10 @@ class TorrentSearcher:
         """
         # FTS search
         if mode in ("literal", "fts"):
+
             if mode == "literal":
                 pattern = '"{}"'.format(pattern.replace('"', '""'))
+
             result = _common_search(
                 tsql="""
                 SELECT rowid, category, title, name, date, length
@@ -723,16 +722,18 @@ class TorrentSearcher:
 
         # Regular expression search
         elif mode == "regex":
+
             try:
                 _get_research(pattern)
             except re.error as e:
                 raise ValueError(f'Invalid regular expression "{pattern}": {e}') from e
+
             result = self._regex_search(pattern)
 
         else:
             raise ValueError(f"Invalid search mode: {mode}")
 
-        return list(result.values())
+        return sorted(result.values(), key=attrgetter("id"))
 
     def _regex_search(self, pattern: str):
         """Perform a regular expression search using multi-processing."""
@@ -769,17 +770,17 @@ def _get_research(pattern: str):
     return lambda s: f(s) is not None
 
 
-_CONN = None
+_conn = None
 
 
 def _initializer(db_uri: str, pattern: str):
     """Initializer for worker processes."""
-    global _CONN
-    _CONN = sqlite3.connect(db_uri, uri=True)
-    _CONN.create_function("RESEARCH", 1, _get_research(pattern), deterministic=True)
+    global _conn
+    _conn = sqlite3.connect(db_uri, uri=True)
+    _conn.create_function("RESEARCH", 1, _get_research(pattern), deterministic=True)
 
 
-def _re_worker(start_id: int, end_id: int):
+def _re_worker(start: int, end: int):
     """
     Worker function to perform regex search on a chunk of data in a
     multi-processing environment.
@@ -798,8 +799,8 @@ def _re_worker(start_id: int, end_id: int):
         WHERE f.id BETWEEN ? AND ?
         AND RESEARCH(f.path)
         """,
-        param=(start_id, end_id),
-        c=_CONN.cursor(),
+        param=(start, end),
+        c=_conn.cursor(),
     )
 
 
