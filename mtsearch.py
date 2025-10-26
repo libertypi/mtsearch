@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
 
 """
-MTeam Scraper and Search Utility
+MTeam Scraper and Searcher
 ================================
 
 Description:
 ------------
-This script is a utility for scraping torrent data from M-Team torrent sites and
-storing it in a local database for fast searching. It supports various search
-modes including SQLite FTS5 matching and regular expression matching.
-
-Main Functionality:
--------------------
-1. Search for torrents in the local database.
-2. Update the local database by scraping new torrents from the website.
+A utility for scraping torrent data from M-Team and storing it in a local
+database. It supports SQLite FTS5 and regular expression searching.
 
 Authors:
 --------
@@ -36,6 +30,7 @@ import time
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
+from functools import cached_property
 from math import ceil
 from operator import attrgetter
 from pathlib import Path
@@ -46,7 +41,6 @@ import requests
 import urllib3
 from fastbencode import bdecode  # pip install fastbencode
 
-_DOMAIN = "https://api.m-team.cc"
 logger = logging.getLogger(__name__)
 
 
@@ -60,7 +54,7 @@ class Torrent:
     name: str
     date: int
     length: int
-    files: list = dataclasses.field(default_factory=list)
+    files: list[tuple[str, int]] = dataclasses.field(default_factory=list)
 
 
 class Database:
@@ -144,9 +138,9 @@ class Database:
 
     COMMIT;
     """
-    _INS_TORRENTS = "INSERT INTO torrents (id, category, title, name, date, length) VALUES (?, ?, ?, ?, ?, ?)"
-    _INS_FILES = "INSERT INTO files (id, path, length) VALUES (?, ?, ?)"
-    _UPD_CATEGORIES = """
+    _SQL_INS_TOR = "INSERT INTO torrents (id, category, title, name, date, length) VALUES (?, ?, ?, ?, ?, ?)"
+    _SQL_INS_FIL = "INSERT INTO files (id, path, length) VALUES (?, ?, ?)"
+    _SQL_UPD_CAT = """
     INSERT INTO categories (id, parent, nameChs, nameCht, nameEng)
     VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
@@ -165,10 +159,9 @@ class Database:
         """Initialize the database."""
         self.path = db_path if isinstance(db_path, Path) else Path(db_path)
         self.conn = sqlite3.connect(self.path)
-        self.c = self.conn.cursor()
 
         # Create tables and triggers
-        self.c.executescript(self._SCHEMA)
+        self.conn.executescript(self._SCHEMA)
 
     def __enter__(self):
         """Enable use of 'with' statement."""
@@ -180,26 +173,44 @@ class Database:
 
     def close(self):
         """Close the database connection."""
-        self.c.execute("PRAGMA optimize")
+        self.conn.execute("PRAGMA optimize")
         self.conn.close()
 
-    def update_categories(self, categories: tuple):
+    def insert_torrent(self, torrent: tuple, files: list[tuple]):
+        """Insert the metadata of a new torrent into the database."""
+        tid = torrent[0]
+        if not all(f[0] == tid for f in files):
+            raise ValueError("File IDs do not match torrent ID.")
+        with self.conn:
+            self.conn.execute(self._SQL_INS_TOR, torrent)
+            self.conn.executemany(self._SQL_INS_FIL, files)
+
+    def delete_torrent(self, tid: int):
+        """Delete the torrent from the database."""
+        param = (tid,)
+        with self.conn:
+            self.conn.execute("DELETE FROM files WHERE id = ?", param)
+            self.conn.execute("DELETE FROM torrents WHERE id = ?", param)
+
+    def update_categories(self, categories: list[tuple]):
         """Update categories when there is a real change."""
         with self.conn:
-            self.c.executemany(self._UPD_CATEGORIES, categories)
+            self.conn.executemany(self._SQL_UPD_CAT, categories)
 
     def get_categories(self, column: str = "nameCht") -> dict:
         """Retrieve a dictionary of category IDs to the corresponding names."""
-        return dict(self.c.execute(f"SELECT id, {column} FROM categories"))
+        if column not in ("nameCht", "nameChs", "nameEng"):
+            raise ValueError(f"Invalid category column: {column}")
+        return dict(self.conn.execute(f"SELECT id, {column} FROM categories"))
 
     def get_total(self) -> int:
         """Get the total number of rows in the 'torrents' table."""
-        return self.c.execute("SELECT COUNT(*) FROM torrents").fetchone()[0]
+        return self.conn.execute("SELECT COUNT(*) FROM torrents").fetchone()[0]
 
     def torrent_exists(self, tid: int) -> bool:
         """Check if a torrent ID exists in the database."""
         return (
-            self.c.execute("SELECT 1 FROM torrents WHERE id = ?", (tid,)).fetchone()
+            self.conn.execute("SELECT 1 FROM torrents WHERE id = ?", (tid,)).fetchone()
             is not None
         )
 
@@ -208,7 +219,7 @@ class Database:
         Check if the torrent exists and update its category and title if they
         have changed.
         """
-        t = self.c.execute(
+        t = self.conn.execute(
             "SELECT category, title FROM torrents WHERE id = ?", (tid,)
         ).fetchone()
         if not t:
@@ -218,23 +229,11 @@ class Database:
                 "Updating %s. Category: '%s' -> '%s'. Title: '%s' -> '%s'.", tid,
                 t[0], category, t[1], title)  # fmt: skip
             with self.conn:
-                self.c.execute(
+                self.conn.execute(
                     "UPDATE torrents SET category = ?, title = ? WHERE id = ?",
                     (category, title, tid),
                 )
         return True
-
-    def insert_torrent(self, torrent: tuple, files: list):
-        """Insert the metadata of a new torrent into the database."""
-        with self.conn:
-            self.c.execute(self._INS_TORRENTS, torrent)
-            self.c.executemany(self._INS_FILES, files)
-
-    def delete_torrent(self, tid: int):
-        """Delete the torrent from the database."""
-        with self.conn:
-            self.c.execute("DELETE FROM torrents WHERE id = ?", (tid,))
-            self.c.execute("DELETE FROM files WHERE id = ?", (tid,))
 
     def recreate(self):
         """Create a new database and insert the current data."""
@@ -244,25 +243,24 @@ class Database:
 
         logger.info("Creating new database: %s", dest_path)
         new_conn = sqlite3.connect(dest_path)
-        new_c = new_conn.cursor()
+        new_conn.executescript(self._SCHEMA)
 
-        new_c.executescript(self._SCHEMA)
         with new_conn:
-            new_c.executemany(
-                self._UPD_CATEGORIES,
-                self.c.execute("SELECT * from categories ORDER BY id"),
+            new_conn.executemany(
+                self._SQL_UPD_CAT,
+                self.conn.execute("SELECT * from categories ORDER BY id"),
             )
-            new_c.executemany(
-                self._INS_TORRENTS,
-                self.c.execute("SELECT * from torrents ORDER BY id"),
+            new_conn.executemany(
+                self._SQL_INS_TOR,
+                self.conn.execute("SELECT * from torrents ORDER BY id"),
             )
-            new_c.executemany(
-                self._INS_FILES,
-                self.c.execute("SELECT * from files ORDER BY id, rowid"),
+            new_conn.executemany(
+                self._SQL_INS_FIL,
+                self.conn.execute("SELECT * from files ORDER BY id, rowid"),
             )
 
         logger.info("Data copying completed. Optimizing...")
-        new_c.executescript("VACUUM; ANALYZE; PRAGMA optimize;")
+        new_conn.executescript("VACUUM; ANALYZE; PRAGMA optimize;")
         logger.info("Database optimization completed.")
         new_conn.close()
 
@@ -360,8 +358,9 @@ class CriticalAPIError(APIError):
 
 
 class MTeamScraper:
-    """A scraper for M-Team torrent sites."""
+    """A scraper for M-Team."""
 
+    _DOMAIN = "https://api.m-team.cc"
     _PAGE_SIZE: int = 200
     _THROTTLE_TIMER: int = 120
 
@@ -378,7 +377,7 @@ class MTeamScraper:
         self._api_key = api_key
         self.db = db
         self.ratelimiter = ratelimiter
-        self._domain = domain or _DOMAIN
+        self._domain = domain or self._DOMAIN
 
         # Setup NordVPN
         self._nord_cmd = None
@@ -436,11 +435,7 @@ class MTeamScraper:
     def update_categories(self):
         """Update categories in the database."""
         try:
-            categories = self._request_api(
-                path="/api/torrent/categoryList",
-                ratelimit=False,
-            )["data"]["list"]
-            categories = tuple(
+            categories = [
                 (
                     int(d["id"]),
                     int(d["parent"]) if d["parent"] else None,
@@ -448,8 +443,11 @@ class MTeamScraper:
                     d["nameCht"],
                     d["nameEng"],
                 )
-                for d in categories
-            )
+                for d in self._request_api(
+                    path="/api/torrent/categoryList",
+                    ratelimit=False,
+                )["data"]["list"]
+            ]
             self.db.update_categories(categories)
         except CriticalAPIError:
             raise
@@ -468,12 +466,13 @@ class MTeamScraper:
         """Retrieve data from the `search` API."""
         params = dict(params)
         params.setdefault("pageSize", self._PAGE_SIZE)
+        headers = {"Content-Type": "application/json"}
         for p in pages:
             params["pageNumber"] = p
             yield from self._request_api(
                 path="/api/torrent/search",
                 ratelimit=False,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
                 json=params,
             )["data"]["data"]
 
@@ -523,7 +522,7 @@ class MTeamScraper:
                 # date
                 date = get_int(data, b"creation date")
                 if date <= 0:
-                    date = strptime(item["createdDate"])
+                    date = strptime(item["createdDate"], "%Y-%m-%d %H:%M:%S")
                     if date <= 0:
                         logger.error("ID: %s. Invalid creation date: '%s'.", tid, date)
                 # name
@@ -628,21 +627,21 @@ class MTeamScraper:
 
     def _dump_torrent(self, tid: int):
         """Download and dump the torrent file."""
-        file = self._dump_dir.joinpath(f"{tid}.torrent")
-        if file.exists():
-            logger.info("Using cache: %s", file.name)
+        path = self._dump_dir.joinpath(f"{tid}.torrent")
+        if path.exists():
+            logger.info("Using cache: %s", path.name)
             try:
-                return file.read_bytes()
-            except Exception as e:
+                return path.read_bytes()
+            except OSError as e:
                 logger.warning(e)
         content = self._download_torrent(tid)
         try:
-            file.write_bytes(content)
-        except Exception as e:
+            path.write_bytes(content)
+        except OSError as e:
             logger.warning(e)
             try:
-                os.unlink(file)
-            except Exception:
+                os.unlink(path)
+            except OSError:
                 pass
         return content
 
@@ -652,15 +651,16 @@ class TorrentSearcher:
 
     def __init__(self, db: Database) -> None:
         self.db = db
-        self._categories = None
 
-    @property
+    @cached_property
     def categories(self):
-        if self._categories is None:
-            self._categories = self.db.get_categories()
-        return self._categories
+        return self.db.get_categories()
 
-    def search_print(self, pattern: str, mode: str):
+    @cached_property
+    def total_torrents(self):
+        return self.db.get_total()
+
+    def print_search(self, pattern: str, mode: str):
         """Perform a search in the database and print the results."""
         sec = time.perf_counter()
         result = self.search(pattern, mode)
@@ -691,7 +691,7 @@ class TorrentSearcher:
                     write(f3("", p, humansize(l)))
 
         write(
-            f"{sep}Found {len(result):,} results in {self.db.get_total():,} torrents ({sec:.4f} seconds).\n"
+            f"{sep}Found {len(result):,} results in {self.total_torrents:,} torrents ({sec:.4f} seconds).\n"
         )
 
     def search(self, pattern: str, mode: str) -> List[Torrent]:
@@ -717,7 +717,7 @@ class TorrentSearcher:
                 WHERE f.path MATCH :pat
                 """,
                 param={"pat": pattern},
-                c=self.db.c,
+                conn=self.db.conn,
             )
 
         # Regular expression search
@@ -738,13 +738,13 @@ class TorrentSearcher:
     def _regex_search(self, pattern: str):
         """Perform a regular expression search using multi-processing."""
         result = {}
-        futures = []
         db = self.db
 
-        lo, hi = db.c.execute("SELECT MIN(id), MAX(id) FROM torrents").fetchone()
+        lo, hi = db.conn.execute("SELECT MIN(id), MAX(id) FROM torrents").fetchone()
         if lo is None:  # Empty database
             return result
 
+        futures = []
         with ProcessPoolExecutor(
             initializer=_initializer,
             initargs=(db.path.as_uri() + "?mode=ro", pattern),
@@ -765,7 +765,7 @@ class TorrentSearcher:
 
 
 def _get_research(pattern: str):
-    """Return a search method for the given regex pattern."""
+    """Return a regex search method for the pattern."""
     f = re.compile(pattern, re.IGNORECASE).search
     return lambda s: f(s) is not None
 
@@ -800,25 +800,17 @@ def _re_worker(start: int, end: int):
         AND RESEARCH(f.path)
         """,
         param=(start, end),
-        c=_conn.cursor(),
+        conn=_conn,
     )
 
 
-def _common_search(tsql: str, fsql: str, param, c: sqlite3.Cursor):
+def _common_search(tsql: str, fsql: str, param, conn: sqlite3.Connection):
     """
-    Execute common search queries for torrents and files.
-
-    Args:
-        tsql: SQL query for torrents table.
-        fsql: SQL query for files table.
-        param: Parameters for the SQL query.
-        c: SQLite cursor object.
-
-    Returns:
-        A dictionary of Torrent objects.
+    Common search function to execute the provided SQL queries and return a
+    dictionary of Torrent objects.
     """
     result = {}
-    for tid, cat, title, name, date, tlen in c.execute(tsql, param):
+    for tid, cat, title, name, date, tlen in conn.execute(tsql, param):
         result[tid] = Torrent(
             id=tid,
             category=cat,
@@ -827,7 +819,7 @@ def _common_search(tsql: str, fsql: str, param, c: sqlite3.Cursor):
             date=date,
             length=tlen,
         )
-    for tid, cat, title, name, date, tlen, fpath, flen in c.execute(fsql, param):
+    for tid, cat, title, name, date, tlen, fpath, flen in conn.execute(fsql, param):
         t = result.get(tid)
         if t is None:
             t = result[tid] = Torrent(
@@ -850,7 +842,7 @@ def get_int(d: dict, k) -> int:
         return 0
 
 
-def strptime(s: str, fmt: str = "%Y-%m-%d %H:%M:%S") -> int:
+def strptime(s: str, fmt: str) -> int:
     """Convert a formatted date string to UTC epoch time."""
     try:
         return int(datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp())
@@ -1043,7 +1035,7 @@ def parse_config(config_path: Path) -> dict:
     """Parse the JSON-formatted configuration file located at `config_path`."""
     config = {
         "api_key": "",
-        "domain": _DOMAIN,
+        "domain": MTeamScraper._DOMAIN,
         "request_interval": 10,
         "hourly_limit": 150,
         "nordvpn_path": "",
@@ -1086,13 +1078,13 @@ def main():
             searcher = TorrentSearcher(db)
 
             if args.pattern:
-                searcher.search_print(args.pattern, args.search_mode)
+                searcher.print_search(args.pattern, args.search_mode)
             else:
                 while True:
                     pattern = input("Pattern: ").strip()
                     if not pattern:
                         break
-                    searcher.search_print(pattern, args.search_mode)
+                    searcher.print_search(pattern, args.search_mode)
 
         elif args.mode == "update":
             init_logger(profile.joinpath("logfile.log"))
