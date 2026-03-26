@@ -39,7 +39,7 @@ from urllib.parse import urljoin
 
 import requests
 import urllib3
-from fastbencode import bdecode  # pip install fastbencode
+from fastbencode import bdecode
 
 logger = logging.getLogger(__name__)
 
@@ -316,9 +316,10 @@ class RateLimiter:
         if len(que) >= self.hourly_limit:
             sleep = que[0] - oldest_allowed
             logger.info(
-                "Waiting for %.2fs. Hourly limit: %ds.", sleep, self.hourly_limit
+                "Sleeping %.2fs (limit: %d requests/hour).",
+                sleep,
+                self.hourly_limit,
             )
-
             time.sleep(sleep)
 
     def _wait_request(self):
@@ -326,7 +327,7 @@ class RateLimiter:
         sleep = self.request_interval - time.monotonic() + self.last_request
         if sleep > 0:
             logger.info(
-                "Waiting for %.2fs. Request interval: %.2fs.",
+                "Sleeping %.2fs (interval: %.2fs).",
                 sleep,
                 self.request_interval,
             )
@@ -427,7 +428,7 @@ class MTeamScraper:
         s.headers.update(
             {
                 "x-api-key": self._api_key,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
                 "Content-Type": "application/x-www-form-urlencoded",
             }
         )
@@ -508,7 +509,7 @@ class MTeamScraper:
                     raise ValueError(f"Invalid torrent ID '{tid}'.")
                 # title
                 title = item["name"].strip()
-                if not (isinstance(title, str) and title):
+                if not title:
                     raise ValueError(f"Invalid title '{title}'.")
                 # category
                 cat = get_int(item, "category")
@@ -529,7 +530,7 @@ class MTeamScraper:
                 data = data[b"info"]
                 k = b"name.utf-8" if b"name.utf-8" in data else b"name"
                 name = data[k].decode(errors="ignore").strip()
-                if not (isinstance(name, str) and name):
+                if not name:
                     raise ValueError(f"Invalid name '{name}'.")
                 # files & length
                 files = data.get(b"files")
@@ -595,7 +596,7 @@ class MTeamScraper:
                 self._init_session()
             else:
                 logger.info(
-                    "Throttled. Waiting for %ss. (%s)", self._THROTTLE_TIMER, message
+                    "Throttled. Waiting for %ds. (%s)", self._THROTTLE_TIMER, message
                 )
                 time.sleep(self._THROTTLE_TIMER)
         elif "key無效" in message:
