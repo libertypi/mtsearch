@@ -12,7 +12,6 @@ database. It supports SQLite FTS5 and regular expression searching.
 Authors:
 --------
 - David Pi
-- ChatGPT - OpenAI
 - GitHub: https://github.com/libertypi/mtsearch
 """
 
@@ -21,10 +20,9 @@ import dataclasses
 import json
 import logging
 import os
+import random
 import re
-import shutil
 import sqlite3
-import subprocess
 import sys
 import time
 from collections import deque
@@ -34,7 +32,7 @@ from functools import cached_property
 from math import ceil
 from operator import attrgetter
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable
 from urllib.parse import urljoin
 
 import requests
@@ -371,26 +369,20 @@ class MTeamScraper:
         db: Database,
         ratelimiter: RateLimiter,
         domain: str = None,
-        nordvpn_path: str = None,
+        nordvpn_auth: tuple = None,
         dump_dir: str = None,
     ):
         """Initialize the MTeamScraper instance."""
+        if not api_key:
+            raise ValueError("API key is required.")
+
         self._api_key = api_key
         self.db = db
         self.ratelimiter = ratelimiter
         self._domain = domain or self._DOMAIN
-
-        # Setup NordVPN
-        self._nord_cmd = None
-        if nordvpn_path:
-            nordvpn_path = shutil.which(nordvpn_path)
-            if nordvpn_path:
-                self._nord_cmd = (
-                    nordvpn_path,
-                    "--connect" if os.name == "nt" else "connect",
-                )
-            else:
-                logger.warning("NordVPN not found. VPN switching will be disabled.")
+        self._nordvpn_auth = (
+            nordvpn_auth if nordvpn_auth and all(nordvpn_auth) else None
+        )
 
         # Setup cache directory
         self._dump_dir = None
@@ -405,16 +397,9 @@ class MTeamScraper:
                 self._dump_dir = dump_dir
                 self._fetch_torrent = self._dump_torrent
 
-        # Initialize the requests session
-        self._init_session()
-        self._url_cache = {}
-
-    def _init_session(self):
-        """Initialize a requests session with retries and headers."""
-        if not self._api_key:
-            raise ValueError("API key is required.")
-
-        self.session = s = requests.Session()
+    @cached_property
+    def session(self):
+        s = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
             max_retries=urllib3.Retry(
                 total=5,
@@ -432,6 +417,12 @@ class MTeamScraper:
                 "Content-Type": "application/x-www-form-urlencoded",
             }
         )
+        if self._nordvpn_auth:
+            url = _nord_proxy(self._nordvpn_auth)
+            if url:
+                s.proxies.update({"https": url, "http": url})
+                logger.info("Using NordVPN proxy: %s", re.search(r"@(.+)?:", url)[1])
+        return s
 
     def update_categories(self):
         """Update categories in the database."""
@@ -562,11 +553,7 @@ class MTeamScraper:
 
     def _request_api(self, path: str, ratelimit: bool = True, **kwargs):
         """Make a POST request to the API and return JSON response."""
-        try:
-            url = self._url_cache[path]
-        except KeyError:
-            url = self._url_cache[path] = urljoin(self._domain, path)
-
+        url = urljoin(self._domain, path)
         logger.info(
             "Requesting: %s. Payload: %s", url, kwargs.get("data") or kwargs.get("json")
         )
@@ -590,10 +577,9 @@ class MTeamScraper:
         manage throttling and retries.
         """
         if "請求過於頻繁" in message:
-            if self._nord_cmd:
-                logger.info("Throttled. Switching NordVPN. (%s)", message)
-                subprocess.run(self._nord_cmd)
-                self._init_session()
+            if self._nordvpn_auth:
+                logger.info("Throttled. Rotating NordVPN proxy. (%s)", message)
+                del self.session  # Reset proxy
             else:
                 logger.info(
                     "Throttled. Waiting for %ds. (%s)", self._THROTTLE_TIMER, message
@@ -695,7 +681,7 @@ class TorrentSearcher:
             f"{sep}Found {len(result):,} results in {self.total_torrents:,} torrents ({sec:.4f} seconds).\n"
         )
 
-    def search(self, pattern: str, mode: str) -> List[Torrent]:
+    def search(self, pattern: str, mode: str) -> list[Torrent]:
         """
         Perform a search on the database based on the given pattern and search mode.
         """
@@ -763,6 +749,26 @@ class TorrentSearcher:
                 result.update(fut.result())
 
         return result
+
+
+def _nord_proxy(credential: tuple[str, str]) -> str | None:
+    """Get a NordVPN proxy_ssl server URL."""
+    try:
+        data = requests.get(
+            "https://api.nordvpn.com/v1/servers/recommendations",
+            params={
+                "filters[servers_technologies][identifier]": "proxy_ssl",
+                "limit": 20,
+            },
+            timeout=15,
+        ).json()
+        url = random.choice(data)["hostname"]
+        if url:
+            user, pwd = credential
+            return f"https://{user}:{pwd}@{url}:89"
+        logger.error("No valid NordVPN proxy servers found.")
+    except Exception as e:
+        logger.error("Failed to fetch NordVPN proxy servers: %s", e)
 
 
 def _get_research(pattern: str):
@@ -903,8 +909,7 @@ A M-Team scraper and search utility.
 Scrapes torrent data from M-Team website and stores it in a local database.
 Supports SQLite FTS5 and regular expression searching.
 
-Author: David Pi
-Contributor: ChatGPT - OpenAI""",
+Author: David Pi""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(title="mode", required=True)
@@ -966,6 +971,7 @@ examples:
     )
 
     # update
+    default_page = 50
     subparser = subparsers.add_parser(
         "update",
         aliases=("u",),
@@ -992,7 +998,7 @@ examples:
     )
     exgroup = subparser.add_argument_group(
         "actions",
-        description="If no action is provided, defaults to: -p 3.",
+        description=f"If no action is provided, defaults to: -p {default_page}.",
     )
     exgroup = exgroup.add_mutually_exclusive_group(required=False)
     exgroup.add_argument(
@@ -1016,9 +1022,10 @@ examples:
     )
 
     args = parser.parse_args()
+    args.profile = _ensure_profile(args.profile)
 
     if args.mode == "update" and not (args.recreate or args.pages or args.id):
-        args.pages = range(1, 4)
+        args.pages = range(1, default_page + 1)
 
     return args
 
@@ -1032,6 +1039,13 @@ def _parse_range(string: str):
     )
 
 
+def _ensure_profile(profile: Path | None) -> Path:
+    if not profile or not profile.is_absolute():
+        profile = Path(__file__).parent.joinpath(profile or "profile")
+    profile.mkdir(parents=True, exist_ok=True)
+    return profile.resolve()
+
+
 def parse_config(config_path: Path) -> dict:
     """Parse the JSON-formatted configuration file located at `config_path`."""
     config = {
@@ -1039,7 +1053,8 @@ def parse_config(config_path: Path) -> dict:
         "domain": MTeamScraper._DOMAIN,
         "request_interval": 10,
         "hourly_limit": 150,
-        "nordvpn_path": "",
+        "nord_user": "",
+        "nord_pass": "",
         "search_params": [{"mode": "adult", "categories": []}],
     }
     try:
@@ -1057,21 +1072,11 @@ def parse_config(config_path: Path) -> dict:
         sys.exit(f"The configuration file at '{config_path}' is malformed.")
 
 
-def ensure_profile(profile: Path | None) -> Path:
-    if profile:
-        profile = profile.resolve()
-    else:
-        profile = Path(__file__).parent.resolve().joinpath("profile")
-    profile.mkdir(parents=True, exist_ok=True)
-    return profile
-
-
 def main():
 
     args = parse_args()
-    profile = ensure_profile(args.profile)
-    conf = parse_config(profile.joinpath("config.json"))
-    db = Database(profile.joinpath("data.db"))
+    conf = parse_config(args.profile.joinpath("config.json"))
+    db = Database(args.profile.joinpath("data.db"))
 
     try:
         if args.mode == "search":
@@ -1088,7 +1093,7 @@ def main():
                     searcher.print_search(pattern, args.search_mode)
 
         elif args.mode == "update":
-            init_logger(profile.joinpath("logfile.log"))
+            init_logger(args.profile.joinpath("logfile.log"))
 
             if args.recreate:
                 db.recreate()
@@ -1104,7 +1109,7 @@ def main():
                 db=db,
                 ratelimiter=limiter,
                 domain=conf["domain"],
-                nordvpn_path=conf["nordvpn_path"],
+                nordvpn_auth=(conf["nord_user"], conf["nord_pass"]),
                 dump_dir=args.dump_dir,
             )
             mt.update_categories()

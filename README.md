@@ -36,9 +36,7 @@ The script uses a configuration file (`config.json`) with the following fields:
 - `domain`: The URL of the M-Team site. Leave this empty to use the default domain.
 - `request_interval`: The time interval (in seconds) between each API request. Set to `0` to make requests without any delay.
 - `hourly_limit`: The maximum number of requests permitted per hour. Set to `0` for no limit.
-- `nordvpn_path`: The file path to the NordVPN executable, used to manage IP rotation and bypass throttling. Ensure the NordVPN client is installed. Common paths include:
-  - **Linux**: `nordvpn`
-  - **Windows**: `C:\Program Files\NordVPN\nordvpn.exe`
+- `nord_user` / `nord_pass`: NordVPN service credentials for proxy rotation, used to bypass API throttling. These are not your account credentials.
 - `search_params`: A list of parameters for the `/api/torrent/search` API used during the execution of `mtsearch.py update -p`. These parameters determine the scope and type of data retrieved. For a complete list of available parameters, consult the official M-Team API documentation.
   Common parameters include:
   - `mode`: Determines the type of content to search. Available values are `normal`, `adult`, `movie`, `music`, `tvshow`, `waterfall`, `rss`, `rankings`.
@@ -52,7 +50,8 @@ Example `config.json`:
     "domain": "",
     "request_interval": 10,
     "hourly_limit": 0,
-    "nordvpn_path": "nordvpn",
+    "nord_user": "",
+    "nord_pass": "",
     "search_params": [
         {
             "mode": "adult",
@@ -149,4 +148,3 @@ A SQLite database named `data.db` will be created in the profile directory, stor
 ## Authors
 
 - David Pi
-- ChatGPT by OpenAI
